@@ -1,0 +1,23 @@
+[project]
+name = "displaypad-server"
+version = "0.1.0"
+description = "Windows-only Python API for ESP32 touchscreen DisplayPads"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "pydantic",
+    "pystray",
+    "pillow",
+    "psutil",
+    "pywin32",
+    "python-multipart",
+    "jinja2",
+    "PyQt6"
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100

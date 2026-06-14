@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+pydantic
+pystray
+pillow
+psutil
+pywin32
+python-multipart
+jinja2

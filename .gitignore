@@ -1,0 +1,44 @@
+.venv/
+__pycache__/
+*.pyc
+data/*.sqlite
+data/logs/
+data/certs/
+.env
+.windsurf/cache/
+
+# PlatformIO / firmware build artifacts
+.pio/
+firmware/**/.pio/
+firmware/**/.vscode/
+
+# Local configuration and secrets
+*.env
+*.env.*
+*.ini.local
+*.cfg.local
+secrets.json
+secrets/*.json
+secrets/*.yaml
+
+# Editor / IDE junk
+.vscode/
+.idea/
+*.code-workspace
+
+# OS-specific cruft
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Local runtime / backup files
+*.log
+*.bak
+*.swp
+*.swo
+
+# Python tooling and caches
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/
