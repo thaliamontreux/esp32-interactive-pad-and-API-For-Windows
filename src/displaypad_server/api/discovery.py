@@ -2,6 +2,7 @@
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
+import base64
 
 from displaypad_server.core.discovery import discovery_service
 from displaypad_server.core.config import get_config, get_api_identity

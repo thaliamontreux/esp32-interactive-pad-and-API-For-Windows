@@ -3742,6 +3742,16 @@ class SystemTrayApp:
         open_action.triggered.connect(self.open_gui)
         menu.addAction(open_action)
 
+        # Restart Server action
+        restart_action = QAction("Restart Server", self.app)
+        restart_action.triggered.connect(self.on_restart_server_from_tray)
+        menu.addAction(restart_action)
+
+        # Refresh Pads action
+        refresh_action = QAction("Refresh Pads", self.app)
+        refresh_action.triggered.connect(self.on_refresh_pads_from_tray)
+        menu.addAction(refresh_action)
+
         menu.addSeparator()
 
         # Exit action
@@ -3793,6 +3803,58 @@ class SystemTrayApp:
     def run(self):
         """Run the application."""
         sys.exit(self.app.exec())
+
+    def on_restart_server_from_tray(self) -> None:
+        """Restart the DisplayPad Server (API + GUI) from the tray menu."""
+
+        resp = QMessageBox.question(
+            None,
+            "Restart Server",
+            "This will restart the DisplayPad Server API and GUI.\n\n"
+            "Any in-progress operations will be interrupted. Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if resp != QMessageBox.StandardButton.Yes:
+            return
+
+        python_exe = sys.executable
+        script_path = os.path.abspath(sys.argv[0])
+        args = sys.argv[1:]
+
+        try:
+            subprocess.Popen([python_exe, script_path, *args], cwd=os.getcwd())
+        except Exception as e:
+            QMessageBox.critical(None, "Restart Server", f"Failed to restart server: {e}")
+            return
+
+        self.quit()
+
+    def on_refresh_pads_from_tray(self) -> None:
+        """Trigger a refresh of pad assignments via the API."""
+
+        try:
+            url = f"http://127.0.0.1:{self.api_port}/api/v1/discovery/pads/refresh"
+            resp = requests.post(url, timeout=5)
+        except Exception as e:
+            QMessageBox.critical(None, "Refresh Pads", f"Failed to contact API: {e}")
+            return
+
+        if not resp.ok:
+            QMessageBox.warning(None, "Refresh Pads", f"API returned HTTP {resp.status_code}")
+            return
+
+        try:
+            data = resp.json()
+        except Exception:
+            data = {}
+
+        refreshed = data.get("refreshed", 0)
+        total = data.get("total", 0)
+        QMessageBox.information(
+            None,
+            "Refresh Pads",
+            f"Refresh request sent.\n\nPads processed: {total}\nAssignments sent: {refreshed}",
+        )
 
 
 def start_gui(api_port: int = 7443):

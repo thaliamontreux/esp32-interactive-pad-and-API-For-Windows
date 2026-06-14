@@ -18,6 +18,7 @@ from displaypad_server.api import (
 )
 from displaypad_server.core.discovery import discovery_service
 from displaypad_server.core.config import get_config, get_api_identity
+from displaypad_server.core import logging as dp_logging
 from displaypad_server.core.icons_sync import sync_icons_from_folder
 from displaypad_server.db.database import connect
 from displaypad_server.windows.processes import list_running_executables
@@ -181,16 +182,15 @@ def create_app() -> FastAPI:
 
                             # Lightweight debug so we can understand why a
                             # given Task Keypad button is or is not marked as
-                            # running when troubleshooting.
-                            try:
-                                print(
-                                    f"[TaskKeypad] pad={pad_uuid[:8]} slot={slot} "
-                                    f"exe={exe!r} name={norm_exe_name!r} "
-                                    f"running={running_now}",
-                                    flush=True,
-                                )
-                            except Exception:
-                                pass
+                            # running when troubleshooting. Gated behind the
+                            # "task_keypad" debug category to avoid flooding
+                            # the console when disabled.
+                            dp_logging.log_debug(
+                                "task_keypad",
+                                f"[TaskKeypad] pad={pad_uuid[:8]} slot={slot} "
+                                f"exe={exe!r} name={norm_exe_name!r} "
+                                f"running={running_now}",
+                            )
 
                         current_state[pad_uuid] = state_for_pad
 
@@ -201,14 +201,11 @@ def create_app() -> FastAPI:
                 for pad_uuid, state in current_state.items():
                     ws = ws_module.connected_pads.get(pad_uuid)
                     if ws is None:
-                        try:
-                            print(
-                                f"[TaskKeypad] no active websocket for pad {pad_uuid[:8]} - "
-                                "skipping task_app_state send",
-                                flush=True,
-                            )
-                        except Exception:
-                            pass
+                        dp_logging.log_debug(
+                            "task_keypad",
+                            f"[TaskKeypad] no active websocket for pad {pad_uuid[:8]} - "
+                            "skipping task_app_state send",
+                        )
                         continue
 
                     prev_state = last_state.get(pad_uuid)
@@ -218,14 +215,11 @@ def create_app() -> FastAPI:
                     # If both the app-running state and the WebSocket object
                     # are unchanged, we can safely skip sending.
                     if prev_state == state and prev_ws == current_ws:
-                        try:
-                            print(
-                                f"[TaskKeypad] skipping send for {pad_uuid[:8]} - "
-                                f"state unchanged and same websocket (id={current_ws})",
-                                flush=True,
-                            )
-                        except Exception:
-                            pass
+                        dp_logging.log_debug(
+                            "task_keypad",
+                            f"[TaskKeypad] skipping send for {pad_uuid[:8]} - "
+                            f"state unchanged and same websocket (id={current_ws})",
+                        )
                         continue
 
                     try:
@@ -236,21 +230,19 @@ def create_app() -> FastAPI:
 
                         # Debug: log when we actually push a task_app_state
                         # message, and whether this was due to a state change
-                        # or a new WebSocket connection for the pad.
-                        try:
-                            reason_parts: list[str] = []
-                            if prev_state != state:
-                                reason_parts.append("state_changed")
-                            if prev_ws != current_ws:
-                                reason_parts.append("new_ws")
-                            reason = ",".join(reason_parts) or "unknown"
-                            print(
-                                f"[TaskKeypad] sending task_app_state to {pad_uuid[:8]} "
-                                f"reason={reason} payload={buttons_payload}",
-                                flush=True,
-                            )
-                        except Exception:
-                            pass
+                        # or a new WebSocket connection for the pad. Gated
+                        # behind the Task Keypad debug category.
+                        reason_parts: list[str] = []
+                        if prev_state != state:
+                            reason_parts.append("state_changed")
+                        if prev_ws != current_ws:
+                            reason_parts.append("new_ws")
+                        reason = ",".join(reason_parts) or "unknown"
+                        dp_logging.log_debug(
+                            "task_keypad",
+                            f"[TaskKeypad] sending task_app_state to {pad_uuid[:8]} "
+                            f"reason={reason} payload={buttons_payload}",
+                        )
 
                         await ws.send_json({
                             "type": "task_app_state",
