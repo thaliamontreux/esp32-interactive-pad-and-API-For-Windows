@@ -12,9 +12,11 @@ bool DisplayManager::begin() {
     #if defined(TFT_BL)
     Serial.println("[Display] Setting up PWM backlight on pin " + String(TFT_BL));
 
-    // Setup LEDC for PWM backlight control (ESP32 Core 3.x API)
-    ledcAttach(TFT_BL, 5000, 8);  // Pin, 5kHz, 8-bit resolution
-    ledcWrite(TFT_BL, 255);  // Full brightness
+    // Setup LEDC for PWM backlight control (ESP32 Arduino core 2.0.x API)
+    const int kBacklightChannel = 0;
+    ledcSetup(kBacklightChannel, 5000, 8);   // Channel, 5kHz, 8-bit resolution
+    ledcAttachPin(TFT_BL, kBacklightChannel);
+    ledcWrite(kBacklightChannel, 255);       // Full brightness
 
     delay(100);
     Serial.println("[Display] Backlight PWM set to full brightness");

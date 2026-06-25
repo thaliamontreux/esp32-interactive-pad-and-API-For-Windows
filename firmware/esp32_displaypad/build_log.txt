@@ -1,0 +1,48 @@
+Processing esp32dev (platform: espressif32@6.4.0; board: esp32dev; framework: arduino)
+--------------------------------------------------------------------------------
+Verbose mode can be enabled via `-v, --verbose` option
+CONFIGURATION: https://docs.platformio.org/page/boards/espressif32/esp32dev.html
+PLATFORM: Espressif 32 (6.4.0) > Espressif ESP32 Dev Module
+HARDWARE: ESP32 240MHz, 320KB RAM, 4MB Flash
+DEBUG: Current (cmsis-dap) External (cmsis-dap, esp-bridge, esp-prog, iot-bus-jtag, jlink, minimodule, olimex-arm-usb-ocd, olimex-arm-usb-ocd-h, olimex-arm-usb-tiny-h, olimex-jtag-tiny, tumpa)
+PACKAGES: 
+ - framework-arduinoespressif32 @ 3.20011.230801 (2.0.11) 
+ - tool-esptoolpy @ 1.40501.0 (4.5.1) 
+ - toolchain-xtensa-esp32 @ 8.4.0+2021r2-patch5
+LDF: Library Dependency Finder -> https://bit.ly/configure-pio-ldf
+LDF Modes: Finder ~ chain, Compatibility ~ soft
+Found 41 compatible libraries
+Scanning dependencies...
+Dependency Graph
+|-- TFT_eSPI @ 2.5.43
+|-- ArduinoJson @ 7.4.3
+|-- ArduinoWebsockets @ 0.5.4
+|-- ESPAsyncWebServer @ 3.11.0
+|-- XPT2046_Touchscreen @ 0.0.0+sha.d57f64c
+|-- PNGdec @ 1.1.6
+|-- NimBLE-Arduino @ 1.4.3
+|-- LittleFS @ 2.0.0
+|-- WiFi @ 2.0.0
+|-- HTTPClient @ 2.0.0
+|-- Preferences @ 2.0.0
+|-- SPI @ 2.0.0
+Building in release mode
+Compiling .pio\build\esp32dev\src\api_client.cpp.o
+Compiling .pio\build\esp32dev\src\bluetooth_manager.cpp.o
+Compiling .pio\build\esp32dev\src\button_renderer.cpp.o
+Compiling .pio\build\esp32dev\src\control_panel.cpp.o
+Compiling .pio\build\esp32dev\src\discovery_beacon.cpp.o
+Compiling .pio\build\esp32dev\src\display.cpp.o
+Compiling .pio\build\esp32dev\src\icon_cache.cpp.o
+Compiling .pio\build\esp32dev\src\ip_keyboard.cpp.o
+Compiling .pio\build\esp32dev\src\main.cpp.o
+Compiling .pio\build\esp32dev\src\pin_keypad.cpp.o
+src/display.cpp: In member function 'bool DisplayManager::begin()':
+src/display.cpp:16:5: error: 'ledcAttach' was not declared in this scope
+     ledcAttach(TFT_BL, 5000, 8);  // Pin, 5kHz, 8-bit resolution
+     ^~~~~~~~~~
+src/display.cpp:16:5: note: suggested alternative: 'ledcAttachPin'
+     ledcAttach(TFT_BL, 5000, 8);  // Pin, 5kHz, 8-bit resolution
+     ^~~~~~~~~~
+     ledcAttachPin
+*** [.pio\build\esp32dev\src\display.cpp.o] Error 1

@@ -83,7 +83,10 @@ def initialize_database(database_path: Path) -> None:
                 pin_lockout_seconds INTEGER NOT NULL DEFAULT 300,
                 last_ip TEXT,
                 time_use_24h INTEGER NOT NULL DEFAULT 0,
-                time_show_am_pm INTEGER NOT NULL DEFAULT 1
+                time_show_am_pm INTEGER NOT NULL DEFAULT 1,
+                blank_on_lock INTEGER NOT NULL DEFAULT 1,
+                layout_profiles TEXT,
+                active_layout_profile TEXT
             )
             """
         )
@@ -104,6 +107,12 @@ def initialize_database(database_path: Path) -> None:
         except Exception:
             pass
 
+        # Per-pad display behavior when the Windows host session is locked.
+        try:
+            conn.execute("ALTER TABLE pads ADD COLUMN blank_on_lock INTEGER NOT NULL DEFAULT 1")
+        except Exception:
+            pass
+
         # Per-page layout support
         try:
             conn.execute("ALTER TABLE pads ADD COLUMN page_count INTEGER NOT NULL DEFAULT 1")
@@ -112,6 +121,16 @@ def initialize_database(database_path: Path) -> None:
 
         try:
             conn.execute("ALTER TABLE pads ADD COLUMN page_button_counts TEXT")
+        except Exception:
+            pass
+
+        try:
+            conn.execute("ALTER TABLE pads ADD COLUMN layout_profiles TEXT")
+        except Exception:
+            pass
+
+        try:
+            conn.execute("ALTER TABLE pads ADD COLUMN active_layout_profile TEXT")
         except Exception:
             pass
 
@@ -133,6 +152,7 @@ def initialize_database(database_path: Path) -> None:
                 label TEXT NOT NULL,
                 icon_id TEXT,
                 action_id TEXT,
+                action_details TEXT,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 bg_color INTEGER,
                 icon_color INTEGER,
@@ -219,6 +239,11 @@ def initialize_database(database_path: Path) -> None:
 
         try:
             conn.execute("ALTER TABLE buttons ADD COLUMN show_text INTEGER NOT NULL DEFAULT 1")
+        except Exception:
+            pass
+
+        try:
+            conn.execute("ALTER TABLE buttons ADD COLUMN action_details TEXT")
         except Exception:
             pass
 

@@ -13,10 +13,10 @@ class AppConfig(BaseModel):
     udp_discovery_port: int = 7442
     data_dir: Path = Path("data")
     database_path: Path = Path("data/displaypad.sqlite")
-    default_control_panel_pin: str = "00000000"
+    default_control_panel_pin: str = "0000"
     pairing_code_length: int = 6
     pairing_code_expire_seconds: int = 120
-    pin_max_digits: int = 8
+    pin_max_digits: int = 4
     pin_max_attempts: int = 5
     pin_lockout_seconds: int = 300
 

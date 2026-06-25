@@ -45,7 +45,8 @@ private:
     String savedSSID;
     String savedPass;
     unsigned long lastReconnectAttempt;
-    static const unsigned long RECONNECT_INTERVAL = 30000;
+    // Automatically retry WiFi connection every 60 seconds when disconnected.
+    static const unsigned long RECONNECT_INTERVAL = 60000;
 
     // Web server for captive portal (AP mode)
     AsyncWebServer* server;

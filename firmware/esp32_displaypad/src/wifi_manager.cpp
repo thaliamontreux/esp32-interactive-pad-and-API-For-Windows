@@ -43,6 +43,10 @@ bool WiFiManager::connect(const String& ssid, const String& password) {
     savedPass = password;
 
     state = WiFiState::CONNECTING;
+
+    // Use DHCP-provided DNS so that NTP (`pool.ntp.org`) and other lookups
+    // respect the network's configuration instead of forcing 8.8.8.8, which
+    // can be blocked on some networks and cause connection instability.
     WiFi.begin(ssid.c_str(), password.c_str());
 
     // Wait up to 20 seconds for connection
@@ -55,9 +59,10 @@ bool WiFiManager::connect(const String& ssid, const String& password) {
     if (WiFi.status() == WL_CONNECTED) {
         state = WiFiState::CONNECTED;
 
-        // Configure NTP for time sync
-        configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-        Serial.println("[WiFi] Connected, NTP configured");
+        // Configure NTP for time sync using pool.ntp.org as the primary
+        // source.
+        configTime(0, 0, "pool.ntp.org");
+        Serial.println("[Time][WiFi] Connected, NTP configured (pool.ntp.org)");
 
         // Wait briefly for time to sync (optional - time() will return 0 until synced)
         delay(100);

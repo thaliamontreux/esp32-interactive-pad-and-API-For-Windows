@@ -66,6 +66,11 @@ bool IconCache::ensureIcon(const String& iconId) {
         return false;
     }
 
+    if (!WiFi.isConnected()) {
+        Serial.println("[IconCache] WiFi not connected; cannot fetch iconId='" + iconId + "'");
+        return false;
+    }
+
     // For application icons we use a synthetic iconId of the form
     // "app_<application_id>" and fetch from the dedicated
     // /api/v1/application-icons/{application_id}.png endpoint. For all

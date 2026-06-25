@@ -1,7 +1,7 @@
 from pathlib import Path
 
 import asyncio
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -15,11 +15,16 @@ from displaypad_server.api import (
     discovery as discovery_api,
     icons as icons_api,
     application_icons as app_icons_api,
+    logging_settings,
+    system_state,
+    time_settings,
 )
 from displaypad_server.core.discovery import discovery_service
 from displaypad_server.core.config import get_config, get_api_identity
+from displaypad_server.ble_bluetooth_bridge import run_managed_bridge, send_task_app_state_ble
 from displaypad_server.core import logging as dp_logging
 from displaypad_server.core.icons_sync import sync_icons_from_folder
+from displaypad_server.core.pad_runtime import set_expected_task_state
 from displaypad_server.db.database import connect
 from displaypad_server.windows.processes import list_running_executables
 import base64
@@ -35,6 +40,31 @@ def create_app() -> FastAPI:
         description="Windows-only API for ESP32 touchscreen DisplayPads",
     )
 
+    @app.middleware("http")
+    async def api_logging_middleware(request: Request, call_next):
+        """Log API requests under the 'api' category in a toggleable way.
+
+        This replaces the need to rely on raw uvicorn access logs when
+        debugging, and can be muted via the Output Messages filter.
+        """
+
+        path = request.url.path
+        method = request.method
+
+        response = await call_next(request)
+
+        try:
+            status = response.status_code
+            dp_logging.log_debug(
+                "api",
+                f"[API] {request.client.host if request.client else '-'} {method} {path} -> {status}",
+            )
+        except Exception:
+            # Never break request handling due to logging issues
+            pass
+
+        return response
+
     # API routes
     # Legacy PIN-based pairing has been replaced by discovery/auto-assign.
     app.include_router(pads.router, prefix="/api/v1/pads", tags=["pads"])
@@ -45,6 +75,9 @@ def create_app() -> FastAPI:
     app.include_router(discovery_api.router, prefix="/api/v1/discovery", tags=["discovery"])
     app.include_router(icons_api.router, prefix="/api/v1", tags=["icons"])
     app.include_router(app_icons_api.router, prefix="/api/v1", tags=["application-icons"])
+    app.include_router(logging_settings.router, prefix="/api/v1", tags=["logging"])
+    app.include_router(system_state.router, prefix="/api/v1", tags=["system"])
+    app.include_router(time_settings.router, prefix="/api/v1", tags=["time"])
 
     async def _task_keypad_monitor() -> None:
         """Background task to keep Task Keypads in sync with running apps.
@@ -58,15 +91,22 @@ def create_app() -> FastAPI:
 
         # Lazy import to avoid circular dependencies at module import time.
         from displaypad_server.api import websocket as ws_module
+        from displaypad_server.ble_bluetooth_bridge import (
+            consume_task_app_state_snapshot_request,
+            request_task_app_state_snapshot,
+        )
 
-        # Cache of last sent state per pad_uuid and last WebSocket object we
-        # delivered to. This lets us:
-        #   - Only send when an app's running state actually changes.
+        # Cache of last sent *visible* state per pad_uuid (set of slots that
+        # were running) and last WebSocket object we delivered to. This lets
+        # us:
+        #   - Only send when the set of running buttons actually changes,
+        #     which is what the Taskpad UI reflects.
         #   - Still send a full snapshot once when a pad connects or
         #     reconnects (new WebSocket object), so reboots get the current
         #     state even if no apps changed since.
-        last_state: dict[str, dict[int, bool]] = {}
+        last_running_slots: dict[str, set[int]] = {}
         last_ws_id: dict[str, int] = {}
+        state_version: dict[str, int] = {}
 
         while True:
             try:
@@ -164,10 +204,17 @@ def create_app() -> FastAPI:
 
                             app_key = norm_exe_path or norm_exe_name
 
-                            running_now = (
-                                norm_exe_path in norm_running_paths
-                                or norm_exe_name in norm_running_names
-                            )
+                            # Prefer matching by full executable path so that
+                            # we only consider an app "running" when the
+                            # exact configured binary is present in the
+                            # process list. If the stored executable has no
+                            # directory component (e.g. just "edge.exe"),
+                            # fall back to name-based matching.
+                            has_dir_component = ("\\" in exe) or ("/" in exe) or (":" in exe)
+                            if has_dir_component:
+                                running_now = norm_exe_path in norm_running_paths
+                            else:
+                                running_now = norm_exe_name in norm_running_names
 
                             # If we've already mapped this application to a
                             # slot on this pad, keep additional buttons for
@@ -183,10 +230,10 @@ def create_app() -> FastAPI:
                             # Lightweight debug so we can understand why a
                             # given Task Keypad button is or is not marked as
                             # running when troubleshooting. Gated behind the
-                            # "task_keypad" debug category to avoid flooding
+                            # "taskpad" debug category to avoid flooding
                             # the console when disabled.
                             dp_logging.log_debug(
-                                "task_keypad",
+                                "taskpad",
                                 f"[TaskKeypad] pad={pad_uuid[:8]} slot={slot} "
                                 f"exe={exe!r} name={norm_exe_name!r} "
                                 f"running={running_now}",
@@ -194,62 +241,96 @@ def create_app() -> FastAPI:
 
                         current_state[pad_uuid] = state_for_pad
 
-                # Push updates to any connected pads only when state changed
-                # or when the WebSocket connection is new for that pad. This
-                # means each app going on/off results in a single push, and a
-                # pad (or server) reboot triggers one full snapshot.
+                # Push updates to pads only when the Task Keypad *visible*
+                # running-state actually changes (i.e. which slots are
+                # running). This ensures that apps starting/stopping trigger a
+                # single update, and avoids refreshes when internal details
+                # change but the visible set of running buttons is the same.
                 for pad_uuid, state in current_state.items():
                     ws = ws_module.connected_pads.get(pad_uuid)
-                    if ws is None:
-                        dp_logging.log_debug(
-                            "task_keypad",
-                            f"[TaskKeypad] no active websocket for pad {pad_uuid[:8]} - "
-                            "skipping task_app_state send",
-                        )
-                        continue
 
-                    prev_state = last_state.get(pad_uuid)
+                    # Compute the set of slots that are currently running.
+                    running_slots = {
+                        int(slot)
+                        for slot, running in state.items()
+                        if running
+                    }
+
+                    prev_state = last_running_slots.get(pad_uuid)
                     prev_ws = last_ws_id.get(pad_uuid)
-                    current_ws = id(ws)
+                    current_ws = id(ws) if ws is not None else prev_ws
+                    ble_snapshot_requested = consume_task_app_state_snapshot_request(pad_uuid)
 
-                    # If both the app-running state and the WebSocket object
-                    # are unchanged, we can safely skip sending.
-                    if prev_state == state and prev_ws == current_ws:
+                    # If the *visible* running state (set of running slots) is
+                    # unchanged, we can safely skip sending. For WiFi pads we
+                    # also gate on the WebSocket identity so reconnects get a
+                    # fresh snapshot; BLE-only pads rely solely on state
+                    # changes.
+                    if (
+                        not ble_snapshot_requested
+                        and prev_state == running_slots
+                        and (ws is None or prev_ws == current_ws)
+                    ):
                         dp_logging.log_debug(
-                            "task_keypad",
+                            "taskpad",
                             f"[TaskKeypad] skipping send for {pad_uuid[:8]} - "
                             f"state unchanged and same websocket (id={current_ws})",
                         )
                         continue
 
                     try:
+                        # Only include buttons that are currently running; the
+                        # pad treats missing slots as "not running" and will
+                        # hide those buttons in Task Keypad mode.
                         buttons_payload = [
-                            {"slot": int(slot), "running": bool(running)}
-                            for slot, running in sorted(state.items())
+                            {"slot": slot, "running": True}
+                            for slot in sorted(running_slots)
                         ]
+
+                        # Bump per-pad version so the pad/bridge can
+                        # correlate this snapshot with its ACK.
+                        ver = state_version.get(pad_uuid, 0) + 1
+                        state_version[pad_uuid] = ver
+                        set_expected_task_state(pad_uuid, sorted(running_slots), ver)
 
                         # Debug: log when we actually push a task_app_state
                         # message, and whether this was due to a state change
                         # or a new WebSocket connection for the pad. Gated
                         # behind the Task Keypad debug category.
                         reason_parts: list[str] = []
-                        if prev_state != state:
+                        if prev_state != running_slots:
                             reason_parts.append("state_changed")
-                        if prev_ws != current_ws:
+                        if ws is not None and prev_ws != current_ws:
                             reason_parts.append("new_ws")
+                        if ble_snapshot_requested:
+                            reason_parts.append("ble_snapshot")
                         reason = ",".join(reason_parts) or "unknown"
                         dp_logging.log_debug(
-                            "task_keypad",
+                            "taskpad",
                             f"[TaskKeypad] sending task_app_state to {pad_uuid[:8]} "
-                            f"reason={reason} payload={buttons_payload}",
+                            f"reason={reason} version={ver} payload={buttons_payload}",
                         )
 
-                        await ws.send_json({
-                            "type": "task_app_state",
-                            "buttons": buttons_payload,
-                        })
-                        last_state[pad_uuid] = state
-                        last_ws_id[pad_uuid] = current_ws
+                        sent_any = False
+
+                        # Send over WebSocket when available (WiFi pads).
+                        if ws is not None:
+                            await ws.send_json({
+                                "type": "task_app_state",
+                                "version": ver,
+                                "buttons": buttons_payload,
+                            })
+                            last_ws_id[pad_uuid] = current_ws
+                            sent_any = True
+
+                        # Also try to send over BLE for Bluetooth-connected pads.
+                        ble_sent = await send_task_app_state_ble(pad_uuid, buttons_payload, ver)
+                        sent_any = sent_any or ble_sent
+
+                        if sent_any:
+                            last_running_slots[pad_uuid] = running_slots
+                        elif ble_snapshot_requested:
+                            request_task_app_state_snapshot(pad_uuid)
                     except Exception as e:  # pragma: no cover - best-effort logging
                         print(f"[TaskKeypad] Failed to send state to {pad_uuid[:16]}...: {e}", flush=True)
 
@@ -258,7 +339,7 @@ def create_app() -> FastAPI:
 
     @app.on_event("startup")
     async def startup_event():
-        """Start UDP discovery, sync icons, re-send assignments, and start monitors."""
+        """Start UDP discovery, BLE bridge, icon sync, and monitors."""
         discovery_service.start()
 
         # Sync icons table with icons folder so /api/v1/icons reflects
@@ -324,10 +405,71 @@ def create_app() -> FastAPI:
         except Exception as e:
             print(f"[Startup] Failed to start Task Keypad monitor: {e}", flush=True)
 
+        # Start one BLE bridge manager per known pad so that each
+        # Bluetooth-connected device gets its own dedicated connector. The
+        # BLE device name used by the firmware is "PAD-" followed by the last
+        # 4 characters of the pad UUID's hex suffix, so we derive the
+        # target device name from pad_uuid here.
+        try:
+            cfg = get_config()
+            api_base = f"http://127.0.0.1:{cfg.api_port}"
+
+            managers: list[tuple[asyncio.Event, asyncio.Task]] = []
+
+            with connect(cfg.database_path) as conn:
+                cursor = conn.execute(
+                    """
+                    SELECT pad_uuid
+                    FROM pads
+                    WHERE enabled = 1 AND revoked = 0
+                    """
+                )
+                rows = cursor.fetchall()
+
+            for row in rows:
+                pad_uuid = row["pad_uuid"]
+                core = pad_uuid[4:] if pad_uuid.startswith("pad-") else pad_uuid
+                suffix = core[-4:]
+                device_name = f"PAD-{suffix}"
+
+                stop_event = asyncio.Event()
+                task = asyncio.create_task(
+                    run_managed_bridge(
+                        api_base=api_base,
+                        device_name=device_name,
+                        stop_event=stop_event,
+                    )
+                )
+                managers.append((stop_event, task))
+                print(
+                    f"[Startup] BLE bridge manager started for {pad_uuid[:16]}... "
+                    f"device_name={device_name} api_base={api_base}",
+                    flush=True,
+                )
+
+            app.state.ble_bridge_managers = managers
+        except Exception as e:
+            print(f"[Startup] Failed to start BLE bridge managers: {e}", flush=True)
+
     @app.on_event("shutdown")
     async def shutdown_event():
-        """Stop UDP discovery service."""
+        """Stop UDP discovery service and BLE bridge manager."""
         discovery_service.stop()
+
+        # Signal all BLE bridge managers to exit and wait briefly for them.
+        managers = getattr(app.state, "ble_bridge_managers", None)
+        if managers:
+            for stop_event, task in managers:
+                try:
+                    stop_event.set()
+                except Exception:
+                    continue
+
+            for _stop_event, task in managers:
+                try:
+                    await asyncio.wait_for(task, timeout=5.0)
+                except Exception:
+                    pass
 
     # Static files (if directory exists)
     if STATIC_DIR.exists():

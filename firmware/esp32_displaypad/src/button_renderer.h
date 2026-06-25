@@ -40,6 +40,7 @@ public:
     // Load configuration
     void loadConfig(const PadConfig& config);
     void clearButtons();
+    void invalidateLayout();
 
     // Render
     void render();
@@ -59,6 +60,11 @@ public:
     // Get button info
     int getButtonCount() { return buttons.size(); }
     const Button& getButton(int index) { return buttons[index]; }
+    int getCurrentPage() const { return currentPage; }
+    int getTotalPages() const { return totalPages; }
+    bool getIsTaskKeypadMode() const { return isTaskKeypadMode; }
+    std::vector<int> getPressedSlots() const;
+    std::vector<int> getActiveTaskSlots() const;
 
     // Visual feedback
     void showPressFeedback(int index);
@@ -79,6 +85,9 @@ public:
     // whether their associated applications are currently running.
     void clearTaskAppState();
     void setTaskAppRunning(int slot, bool running);
+
+    // Host lock screen
+    void showHostLockScreen();
 
 private:
     std::vector<Button> buttons;
@@ -104,10 +113,15 @@ private:
     // True when the current pad config mode is "task_keypad"; in this mode
     // only buttons whose taskAppRunning flag is true are rendered.
     bool isTaskKeypadMode;
+    bool needsFullSurfaceClear;
 
     void drawButton(const Button& btn, bool highlight = false);
     void drawButtonLabel(const Button& btn);
     void drawResetButton();
+    void clearButtonRegion(const Button& btn);
+    void clearAllButtonRegions();
+    void drawCurrentPageButtons();
+    void clearPageIndicatorArea();
 
     void drawPageIndicators();
     int checkPageIndicatorTouch(int x, int y);

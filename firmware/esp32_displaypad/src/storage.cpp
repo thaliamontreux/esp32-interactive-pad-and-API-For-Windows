@@ -87,6 +87,27 @@ String SecureStorage::getPINHash() {
     return prefs.getString(NVS_KEY_PIN_HASH, "");
 }
 
+bool SecureStorage::setTimeOffsetMinutes(int32_t minutes) {
+    return prefs.putInt(NVS_KEY_TIME_OFFSET, minutes) > 0;
+}
+
+int32_t SecureStorage::getTimeOffsetMinutes() {
+    // Default to 0 so that, unless the user explicitly overrides it in the
+    // control panel, the pad uses the server-provided timezone offset from
+    // the pad config as the source of truth for the topbar clock.
+    return prefs.getInt(NVS_KEY_TIME_OFFSET, 0);
+}
+
+bool SecureStorage::setUseUsAutoDst(bool enabled) {
+    return prefs.putBool(NVS_KEY_US_AUTO_DST, enabled) > 0;
+}
+
+bool SecureStorage::getUseUsAutoDst() {
+    // Default to true so that fresh devices use US DST rules automatically
+    // for the default US Central base offset.
+    return prefs.getBool(NVS_KEY_US_AUTO_DST, true);
+}
+
 bool SecureStorage::setWiFiSSID(const String& ssid) {
     return prefs.putString(NVS_KEY_WIFI_SSID, ssid) > 0;
 }
@@ -109,6 +130,15 @@ bool SecureStorage::setLastIpFailureCount(uint32_t count) {
 
 uint32_t SecureStorage::getLastIpFailureCount() {
     return prefs.getUInt(NVS_KEY_LAST_IP_FAILS, 0);
+}
+
+bool SecureStorage::setConnectionMode(uint8_t mode) {
+    return prefs.putUChar(NVS_KEY_CONN_MODE, mode) > 0;
+}
+
+uint8_t SecureStorage::getConnectionMode() {
+    // Default to AUTO (2) for existing devices
+    return prefs.getUChar(NVS_KEY_CONN_MODE, 2);
 }
 
 bool SecureStorage::setPaired(bool paired) {

@@ -54,6 +54,12 @@ VK_CODES: dict[str, int] = {
     "volup": 0xAF, "voldown": 0xAE, "mute": 0xAD,
 }
 
+MODIFIER_KEYS = {
+    "shift", "ctrl", "control", "alt",
+    "lshift", "rshift", "lctrl", "rctrl", "lalt", "ralt",
+    "win", "lwin", "rwin",
+}
+
 # Windows C structures
 class KEYBDINPUT(ctypes.Structure):
     _fields_ = [
@@ -82,7 +88,7 @@ class INPUT(ctypes.Structure):
 # Windows API functions
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 
-# keybd_event is deprecated but simpler and sufficient for our macro use case.
+# keybd_event is deprecated but simple and sufficient for our macro use case.
 _keybd_event = user32.keybd_event
 _keybd_event.argtypes = [ctypes.c_ubyte, ctypes.c_ubyte, ctypes.c_uint, ctypes.c_ulonglong]
 _keybd_event.restype = None
@@ -194,6 +200,7 @@ def execute_macro(macro_type: str, payload: dict) -> bool:
             combo_delay_ms = max(0, min(combo_delay_ms, 1000))
 
             executed_any = False
+            pending_modifiers: list[str] = []
             for rec in records:
                 if not isinstance(rec, dict):
                     continue
@@ -213,14 +220,37 @@ def execute_macro(macro_type: str, payload: dict) -> bool:
                     else:
                         keys = [str(k) for k in combo]
 
+                    normalized_keys = [k.strip().lower() for k in keys]
+                    if normalized_keys and all(k in MODIFIER_KEYS for k in normalized_keys):
+                        pending_modifiers = keys
+                        continue
+
+                    if pending_modifiers:
+                        keys = [*pending_modifiers, *keys]
+                        pending_modifiers = []
+
+                    # For security/privacy, avoid logging the actual key
+                    # contents (which may include passwords or other
+                    # sensitive data). Instead, log only metadata about the
+                    # combo such as the number of keys.
+                    key_count = len(keys)
+
                     try:
-                        # Debug: log each combo before sending
-                        print(f"[SENDINPUT] key_sequence_v2 combo={keys}", flush=True)
+                        # Redacted logging: no actual key values.
+                        print(
+                            f"[SENDINPUT] key_sequence_v2 combo=[REDACTED] "
+                            f"(keys={key_count})",
+                            flush=True,
+                        )
                         send_key_combo(keys)
                         executed_any = True
                     except Exception as e:
                         # Skip invalid combos but continue executing the rest.
-                        print(f"[SENDINPUT] combo failed keys={keys} error={e}", flush=True)
+                        print(
+                            "[SENDINPUT] combo failed (keys=[REDACTED], "
+                            f"count={key_count}) error={e}",
+                            flush=True,
+                        )
                         continue
 
                     if combo_delay_ms > 0:

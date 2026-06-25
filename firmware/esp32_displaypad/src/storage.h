@@ -39,6 +39,14 @@ public:
     bool setPINHash(const String& hash);
     String getPINHash();
 
+    // Time offset (minutes from UTC or server-provided baseline)
+    bool setTimeOffsetMinutes(int32_t minutes);
+    int32_t getTimeOffsetMinutes();
+
+    // US auto DST flag (applies US DST rules to the stored base offset)
+    bool setUseUsAutoDst(bool enabled);
+    bool getUseUsAutoDst();
+
     // WiFi credentials
     bool setWiFiSSID(const String& ssid);
     String getWiFiSSID();
@@ -53,6 +61,10 @@ public:
     // had to fall back to full network discovery.
     bool setLastIpFailureCount(uint32_t count);
     uint32_t getLastIpFailureCount();
+
+    // Connection mode preference (0=WiFi, 1=Bluetooth, 2=Auto)
+    bool setConnectionMode(uint8_t mode);
+    uint8_t getConnectionMode();
 
     // Factory reset
     bool factoryReset();

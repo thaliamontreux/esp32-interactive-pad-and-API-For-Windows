@@ -63,6 +63,22 @@ def bring_window_to_front(pid: int) -> bool:
     try:
         user32 = ctypes.WinDLL("user32", use_last_error=True)
 
+        GetForegroundWindow = user32.GetForegroundWindow
+        GetForegroundWindow.argtypes = []
+        GetForegroundWindow.restype = wintypes.HWND
+
+        GetCurrentThreadId = ctypes.WinDLL("kernel32", use_last_error=True).GetCurrentThreadId
+        GetCurrentThreadId.argtypes = []
+        GetCurrentThreadId.restype = wintypes.DWORD
+
+        GetWindowThreadProcessId = user32.GetWindowThreadProcessId
+        GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        GetWindowThreadProcessId.restype = wintypes.DWORD
+
+        AttachThreadInput = user32.AttachThreadInput
+        AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+        AttachThreadInput.restype = wintypes.BOOL
+
         SetForegroundWindow = user32.SetForegroundWindow
         SetForegroundWindow.argtypes = [wintypes.HWND]
         SetForegroundWindow.restype = wintypes.BOOL
@@ -71,24 +87,64 @@ def bring_window_to_front(pid: int) -> bool:
         ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
         ShowWindow.restype = wintypes.BOOL
 
+        ShowWindowAsync = user32.ShowWindowAsync
+        ShowWindowAsync.argtypes = [wintypes.HWND, ctypes.c_int]
+        ShowWindowAsync.restype = wintypes.BOOL
+
+        BringWindowToTop = user32.BringWindowToTop
+        BringWindowToTop.argtypes = [wintypes.HWND]
+        BringWindowToTop.restype = wintypes.BOOL
+
+        SetActiveWindow = user32.SetActiveWindow
+        SetActiveWindow.argtypes = [wintypes.HWND]
+        SetActiveWindow.restype = wintypes.HWND
+
         IsIconic = user32.IsIconic
         IsIconic.argtypes = [wintypes.HWND]
         IsIconic.restype = wintypes.BOOL
 
         SW_RESTORE = 9
+        SW_SHOW = 5
 
         hwnds = _enum_windows_for_pid(pid)
         if not hwnds:
             return False
 
-        # Prefer the first window; in practice this is usually the main one.
-        hwnd = hwnds[0]
+        for hwnd in hwnds:
+            if IsIconic(hwnd):
+                ShowWindowAsync(hwnd, SW_RESTORE)
+                ShowWindow(hwnd, SW_RESTORE)
+            else:
+                ShowWindowAsync(hwnd, SW_SHOW)
+                ShowWindow(hwnd, SW_SHOW)
 
-        # If minimized, restore before bringing to foreground.
-        if IsIconic(hwnd):
-            ShowWindow(hwnd, SW_RESTORE)
+            foreground = GetForegroundWindow()
+            current_thread = GetCurrentThreadId()
+            foreground_pid = wintypes.DWORD(0)
+            foreground_thread = GetWindowThreadProcessId(foreground, ctypes.byref(foreground_pid)) if foreground else 0
+            target_pid = wintypes.DWORD(0)
+            target_thread = GetWindowThreadProcessId(hwnd, ctypes.byref(target_pid))
 
-        SetForegroundWindow(hwnd)
-        return True
+            attached_foreground = False
+            attached_target = False
+            try:
+                if foreground_thread and foreground_thread != current_thread:
+                    attached_foreground = bool(AttachThreadInput(current_thread, foreground_thread, True))
+                if target_thread and target_thread != current_thread:
+                    attached_target = bool(AttachThreadInput(current_thread, target_thread, True))
+
+                BringWindowToTop(hwnd)
+                SetActiveWindow(hwnd)
+                SetForegroundWindow(hwnd)
+            finally:
+                if attached_target:
+                    AttachThreadInput(current_thread, target_thread, False)
+                if attached_foreground:
+                    AttachThreadInput(current_thread, foreground_thread, False)
+
+            if int(GetForegroundWindow()) == int(hwnd):
+                return True
+
+        return False
     except Exception:
         return False

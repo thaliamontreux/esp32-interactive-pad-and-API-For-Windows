@@ -4,19 +4,23 @@
 #include <Arduino.h>
 #include "display.h"
 #include "pin_keypad.h"
+#include "connection_mode.h"
 
 enum class ControlPanelAction {
     NONE,
     WIFI_SETUP,
+    BLUETOOTH_PAIRING,
     PAIRING_SETUP,
     DEVICE_DIAGNOSTICS,
     HOST_DIAGNOSTICS,
     CONFIG_REFRESH,
     RECONNECT_API,
+    CONNECTION_MODE,
     RESET_PAIRING,
     RESET_WIFI,
     FACTORY_RESET,
     NEW_PROFILE,
+    TIME_SETTINGS,
     EXIT
 };
 
@@ -40,6 +44,8 @@ public:
     void showPairingSetup();
     void showDeviceDiagnostics();
     void showHostDiagnostics();
+    void showTimeSettings();
+    void showConnectionModeSettings();
 
     // Reset actions
     bool confirmReset(const String& title, const String& message);
@@ -50,15 +56,18 @@ public:
 
 private:
     void drawMainMenu();
-    void drawMenuItem(int y, const String& text, bool selected);
+    void drawSubscreenHeader(const String& title);
+    bool handleBackButtonTouch(int x, int y);
+    void drawMenuItem(int x, int y, int w, int h, const String& text, bool selected);
     int getMenuItemAt(int x, int y);
     void executeAction(ControlPanelAction action);
 
-    static const int MENU_ITEMS = 11;
+    static const int MENU_ITEMS = 14;
     static const char* menuLabels[MENU_ITEMS];
     static const ControlPanelAction menuActions[MENU_ITEMS];
 
     int selectedIndex;
+    int menuScrollRow;  // index of first visible row in the 2-column grid
     bool active;
     unsigned long startupWindowStart;
 };

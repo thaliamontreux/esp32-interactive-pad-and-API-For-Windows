@@ -33,6 +33,15 @@ def run_api_server(config) -> None:
         host=config.api_host,
         port=config.api_port,
         log_level="info",
+        # ESP32 pads have blocking UI flows (e.g. modal control-panel screens
+        # and the network discovery scan) during which they cannot service the
+        # WebSocket and respond to keepalive PINGs. The default 20s ping_timeout
+        # therefore drops them with "1011 keepalive ping timeout" and causes a
+        # reconnect loop. Keep sending pings to hold the socket open, but do not
+        # enforce a short PONG deadline; device liveness is handled by the pad's
+        # own reconnect logic and periodic config-version checks.
+        ws_ping_interval=20,
+        ws_ping_timeout=None,
     )
 
 

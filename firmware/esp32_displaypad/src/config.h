@@ -19,8 +19,8 @@
 #define FW_VERSION "0.1.0"
 
 // Pin settings
-#define DEFAULT_PIN "00000000"
-#define PIN_MAX_LENGTH 8
+#define DEFAULT_PIN "0000"
+#define PIN_MAX_LENGTH 4
 #define PIN_MAX_ATTEMPTS 5
 #define PIN_LOCKOUT_SECONDS 300
 
@@ -77,8 +77,15 @@
 #define NVS_KEY_PAIRED "paired"
 #define NVS_KEY_WIFI_SSID "wifi_ssid"
 #define NVS_KEY_WIFI_PASS "wifi_pass"
+// User-configured timezone offset (minutes from UTC); 0 means use server
+// provided offset.
+#define NVS_KEY_TIME_OFFSET "time_offset"
+// Whether to apply US DST rules automatically to the stored base offset.
+#define NVS_KEY_US_AUTO_DST "us_auto_dst"
 // Diagnostics: count how many times we had to fall back from last-known API IP
 // to full network discovery because direct connection failed for 5 minutes.
 #define NVS_KEY_LAST_IP_FAILS "last_ip_fails"
+// Connection mode: 0 = WiFi, 1 = Bluetooth, 2 = Auto (prefer BLE, fallback WiFi)
+#define NVS_KEY_CONN_MODE "conn_mode"
 
 #endif

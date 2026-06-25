@@ -63,6 +63,7 @@ public:
     APIStatus checkConfigVersion(uint32_t& version, bool& updateRequired);
     APIStatus getConfig(PadConfig& config);
     APIStatus confirmConfigApplied(uint32_t version);
+    APIStatus getHostSessionState(bool& locked);
 
     // Button press
     APIStatus sendButtonPress(int slot, const String& pressType = "tap");
@@ -85,6 +86,7 @@ public:
     // viewed per-device in the GUI.
     void startLogSession(const String& sessionUUID, const String& bootReason, const String& fwVersion);
     void sendLogLine(const String& sessionUUID, uint32_t seq, const String& message, const String& level = "INFO");
+    void sendPadStatus(const String& payload);
 
 private:
     String serverHost;

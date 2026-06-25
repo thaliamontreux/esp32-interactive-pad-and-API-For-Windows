@@ -166,19 +166,37 @@ bool PINKeypad::getNumericInput(String& outInput, const String& prompt, int maxD
 }
 
 bool PINKeypad::validatePIN(const String& pin) {
-    // For now, validate against default or check with server
-    // Simplified: accept default PIN or any 8-digit PIN
-    if (pin == DEFAULT_PIN) return true;
+    // Enforce an exact 4-digit PIN on the device. There are two cases:
+    //  1) Default PIN in use (no stored hash): accept DEFAULT_PIN only.
+    //  2) Custom PIN set (stored hash present): accept only if the hash
+    //     of the entered PIN matches the stored hash.
 
-    // Check length
-    if (pin.length() != PIN_MAX_LENGTH) return false;
+    if (pin.length() != PIN_MAX_LENGTH) {
+        return false;
+    }
 
-    // Check if all digits
+    // All digits check
     for (int i = 0; i < pin.length(); i++) {
         if (!isdigit(pin[i])) return false;
     }
 
-    return true;
+    String storedHash = storage.getPINHash();
+    if (storedHash.length() == 0) {
+        // No custom PIN set; use firmware default
+        return pin == DEFAULT_PIN;
+    }
+
+    // Compare SHA-256 hash of entered PIN with stored hash
+    uint8_t hash[32];
+    mbedtls_sha256((const uint8_t*)pin.c_str(), pin.length(), hash, 0);
+
+    char hashStr[65];
+    for (int i = 0; i < 32; i++) {
+        sprintf(&hashStr[i * 2], "%02X", hash[i]);
+    }
+    hashStr[64] = '\0';
+
+    return storedHash.equalsIgnoreCase(hashStr);
 }
 
 bool PINKeypad::setPIN(const String& newPIN) {
@@ -214,7 +232,7 @@ void PINKeypad::drawKeypad() {
     const char* row1[5] = {"6", "7", "8", "9", "0"};
 
     int startX = (SCREEN_WIDTH - (5 * KEY_W + 4 * KEY_SPACING)) / 2;
-    int startY = 70;  // Below PIN display
+    int startY = 90;  // Below compact PIN display
 
     display.setTextSize(2);
     display.setTextDatum(MC_DATUM);
@@ -264,26 +282,46 @@ void PINKeypad::drawPINDisplay() {
     display.setTextSize(2);
     display.setTextDatum(TC_DATUM);
     display.setTextColor(COLOR_WHITE, COLOR_BLACK);
-    display.drawCentreString(promptText, SCREEN_WIDTH/2, 20);
+    display.drawCentreString(promptText, SCREEN_WIDTH/2, 18);
 
-    // PIN display area
-    display.fillRect(20, 60, SCREEN_WIDTH - 40, 50, COLOR_DARK_GRAY);
-    display.drawRect(20, 60, SCREEN_WIDTH - 40, 50, COLOR_WHITE);
+    // PIN display area (compact band for four indicator dots)
+    int boxX = 40;
+    int boxY = 40;
+    int boxW = SCREEN_WIDTH - 80;
+    int boxH = 30;
+
+    display.fillRect(boxX, boxY, boxW, boxH, COLOR_DARK_GRAY);
+    display.drawRect(boxX, boxY, boxW, boxH, COLOR_WHITE);
 
     updateDisplay();
 }
 
 void PINKeypad::updateDisplay() {
-    // Show PIN as asterisks
-    String masked = "";
-    for (int i = 0; i < currentPIN.length(); i++) {
-        masked += "*";
-    }
+    // Draw four status dots representing each PIN digit. Empty = white,
+    // entered = green.
+    int boxX = 40;
+    int boxY = 40;
+    int boxW = SCREEN_WIDTH - 80;
+    int boxH = 30;
 
-    display.setTextSize(3);
-    display.setTextDatum(MC_DATUM);
-    display.setTextColor(COLOR_WHITE, COLOR_DARK_GRAY);
-    display.drawCentreString(masked, SCREEN_WIDTH/2, 85);
+    // Clear inside the PIN box
+    display.fillRect(boxX + 1, boxY + 1, boxW - 2, boxH - 2, COLOR_DARK_GRAY);
+
+    const int totalDots = 4;
+    int radius = 5;
+    int centerY = boxY + boxH / 2;
+
+    int totalWidth = totalDots * (radius * 2) + (totalDots - 1) * 12;
+    int startX = SCREEN_WIDTH / 2 - totalWidth / 2 + radius;
+
+    int filled = currentPIN.length();
+    if (filled > totalDots) filled = totalDots;
+
+    for (int i = 0; i < totalDots; ++i) {
+        int cx = startX + i * (2 * radius + 12);
+        uint16_t color = (i < filled) ? COLOR_GREEN : COLOR_WHITE;
+        display.fillCircle(cx, centerY, radius, color);
+    }
 
     // Show attempts if any - positioned below keypad
     if (attempts > 0) {
@@ -291,15 +329,15 @@ void PINKeypad::updateDisplay() {
         display.setTextDatum(TC_DATUM);
         display.setTextColor(COLOR_RED, COLOR_BLACK);
         String msg = "Attempt " + String(attempts) + "/" + String(maxAttempts);
-        display.fillRect(20, 230, SCREEN_WIDTH - 40, 10, COLOR_BLACK);
-        display.drawCentreString(msg, SCREEN_WIDTH/2, 230);
+        display.fillRect(20, 220, SCREEN_WIDTH - 40, 12, COLOR_BLACK);
+        display.drawCentreString(msg, SCREEN_WIDTH/2, 222);
     }
 }
 
 int PINKeypad::getKeyAt(int x, int y) {
     // Match the new 5-column layout
     int startX = (SCREEN_WIDTH - (5 * KEY_W + 4 * KEY_SPACING)) / 2;
-    int startY = 70;  // Must match drawKeypad()
+    int startY = 90;  // Must match drawKeypad()
 
     Serial.println("[PINKeypad] getKeyAt x=" + String(x) + " y=" + String(y));
 

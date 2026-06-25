@@ -8,9 +8,11 @@ from fastapi import APIRouter, HTTPException, Depends, Header, Query
 from pydantic import BaseModel
 
 from displaypad_server.core.config import get_config, get_api_identity
+from displaypad_server.core.timezone_config import get_timezone_config, get_current_offset_minutes
 from displaypad_server.core.crypto import hmac_verify, hmac_sign, verify_secret
 from displaypad_server.core.security import validate_timestamp, check_and_store_nonce, redact_secret
 from displaypad_server.core.layout import generate_layout, ButtonRect
+from displaypad_server.core.pad_runtime import get_pad_runtime_snapshot, list_pad_runtime_snapshots
 from displaypad_server.db.database import connect
 
 router = APIRouter()
@@ -37,6 +39,7 @@ class ButtonConfig(BaseModel):
     label: str
     icon_id: str | None = None
     action_id: str | None = None
+    action_details: str | None = None
     # Colors are stored as optional hex strings (e.g. "#RRGGBB").
     bg_color: str | None = None
     icon_color: str | None = None
@@ -44,6 +47,11 @@ class ButtonConfig(BaseModel):
     show_text: bool = True
     # Optional application icon information for "Launch Application" actions.
     application_id: int | None = None
+    application_name: str | None = None
+    executable_path: str | None = None
+    working_directory: str | None = None
+    arguments: str | None = None
+    icon_path: str | None = None
     has_application_icon: bool = False
     # Optional version/hash for the application icon so firmware can
     # invalidate its local cache when the icon file changes.
@@ -64,9 +72,10 @@ class TimeConfig(BaseModel):
 
     use_24h: bool = False
     show_am_pm: bool = True
-    # Offset in minutes from UTC for the API host's local timezone. The ESP32
-    # uses this to render its taskbar clock in the same timezone as the
-    # system running the DisplayPad API.
+    # Offset in minutes from UTC for the DisplayPad Server's configured
+    # timezone (default CDT). The ESP32 firmware currently treats the epoch
+    # from time updates as a wall-clock value, but this offset is still
+    # provided for informational/diagnostic purposes and future use.
     timezone_offset_minutes: int = 0
 
 
@@ -77,11 +86,14 @@ class PadConfigResponse(BaseModel):
     button_count: int
     page_count: int
     page_button_counts: list[int] | None = None
+    layout_profiles: list[dict] | None = None
+    active_layout_profile: str | None = None
     config_version: int
     control_panel_pin: ControlPanelPINPolicy
     screen: ScreenConfig
     layout: LayoutConfig
     time: TimeConfig
+    blank_on_lock: bool = True
     buttons: list[ButtonConfig]
 
 
@@ -287,6 +299,19 @@ def list_pads() -> dict:
     return {"pads": pads}
 
 
+@router.get("/runtime", response_model=dict)
+def list_pad_runtime() -> dict:
+    return {"pads": list_pad_runtime_snapshots()}
+
+
+@router.get("/{pad_id}/runtime", response_model=dict)
+def get_pad_runtime(pad_id: str) -> dict:
+    snapshot = get_pad_runtime_snapshot(pad_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Pad runtime state not found")
+    return snapshot
+
+
 @router.get("/{pad_id}/config/version", response_model=ConfigVersionResponse)
 def get_config_version(
     pad_id: str,
@@ -360,6 +385,8 @@ def get_pad_config(
                    button_count,
                    page_count,
                    page_button_counts,
+                   layout_profiles,
+                   active_layout_profile,
                    screen_width,
                    screen_height,
                    config_version,
@@ -369,7 +396,8 @@ def get_pad_config(
                    pin_max_attempts,
                    pin_lockout_seconds,
                    time_use_24h,
-                   time_show_am_pm
+                   time_show_am_pm,
+                   blank_on_lock
             FROM pads WHERE id = ?
             """,
             (pad_internal_id,)
@@ -383,12 +411,17 @@ def get_pad_config(
                    label,
                    icon_id,
                    action_id,
+                   action_details,
                    bg_color,
                    icon_color,
                    text_color,
                    show_text,
                    application_id,
-                   executable_path
+                   application_name,
+                   executable_path,
+                   working_directory,
+                   arguments,
+                   icon_path
             FROM buttons WHERE pad_id = ? AND enabled = 1
             ORDER BY slot
             """,
@@ -401,12 +434,22 @@ def get_pad_config(
     width, height = pad_row["screen_width"], pad_row["screen_height"]
     legacy_per_page = pad_row["button_count"]
     raw_counts = pad_row["page_button_counts"]
+    raw_profiles = pad_row["layout_profiles"]
     page_counts: list[int] = []
+    layout_profiles: list[dict] = []
     if raw_counts:
         try:
             page_counts = [max(1, min(32, int(c))) for c in _json.loads(raw_counts)]
         except Exception:
             page_counts = []
+
+    if raw_profiles:
+        try:
+            parsed_profiles = _json.loads(raw_profiles)
+            if isinstance(parsed_profiles, list):
+                layout_profiles = [p for p in parsed_profiles if isinstance(p, dict)]
+        except Exception:
+            layout_profiles = []
 
     if not page_counts:
         # Legacy fallback: single per-page count, compute pages from max slot
@@ -552,11 +595,17 @@ def get_pad_config(
                 label=label,
                 icon_id=icon_id,
                 action_id=action_id,
+                action_details=btn["action_details"] if btn else None,
                 bg_color=bg_color,
                 icon_color=icon_color,
                 text_color=text_color,
                 show_text=show_text,
                 application_id=application_id,
+                application_name=btn["application_name"] if btn else None,
+                executable_path=btn["executable_path"] if btn else None,
+                working_directory=btn["working_directory"] if btn else None,
+                arguments=btn["arguments"] if btn else None,
+                icon_path=btn["icon_path"] if btn else None,
                 has_application_icon=has_app_icon,
                 application_icon_version=application_icon_version,
             ))
@@ -575,11 +624,11 @@ def get_pad_config(
         )
         conn.commit()
 
-    # Compute the API host's current UTC offset so devices can render the
-    # taskbar clock in the same timezone as the server.
-    local_now = datetime.now().astimezone()
-    offset = local_now.utcoffset() or timedelta(0)
-    timezone_offset_minutes = int(offset.total_seconds() // 60)
+    # Compute the current UTC offset (in minutes) for the configured
+    # DisplayPad Server timezone so devices can render their clocks to match
+    # the server's selected timezone.
+    tz_cfg = get_timezone_config()
+    timezone_offset_minutes = get_current_offset_minutes()
 
     return PadConfigResponse(
         pad_id=pad_id,
@@ -588,6 +637,8 @@ def get_pad_config(
         button_count=page_counts[0] if page_counts else legacy_per_page or 6,
         page_count=page_count,
         page_button_counts=page_counts,
+        layout_profiles=layout_profiles,
+        active_layout_profile=pad_row["active_layout_profile"],
         config_version=pad_row["config_version"],
         control_panel_pin=ControlPanelPINPolicy(
             enabled=True,
@@ -608,6 +659,7 @@ def get_pad_config(
             ),
             timezone_offset_minutes=timezone_offset_minutes,
         ),
+        blank_on_lock=bool(pad_row["blank_on_lock"] if "blank_on_lock" in pad_row.keys() else 1),
         buttons=button_configs,
     )
 
@@ -646,21 +698,35 @@ def config_applied(
 def button_press(
     pad_id: str,
     request: ButtonPressRequest,
-    x_pad_uuid: str = Header(...),
-    x_device_token: str = Header(...),
+    x_pad_uuid: str | None = Header(default=None),
+    x_device_token: str | None = Header(default=None),
 ) -> dict:
-    """Handle button press from pad."""
-    # Authenticate the request
-    pad = _authenticate_pad_simple(x_pad_uuid, x_device_token)
+    """Handle button press from pad.
+
+    When called by the ESP32 firmware, authentication headers are provided and
+    we validate the device token. When called from a local component such as
+    the BLE bridge or GUI, headers may be omitted and we trust the pad_id
+    parameter (mirroring get_pad_config behavior).
+    """
 
     config = get_config()
 
-    with connect(config.database_path) as conn:
-        # Get pad internal ID
-        cursor = conn.execute("SELECT id FROM pads WHERE pad_uuid = ?", (pad_id,))
-        pad_internal_id = cursor.fetchone()["id"]
+    if x_pad_uuid and x_device_token:
+        pad = _authenticate_pad_simple(x_pad_uuid, x_device_token)
+        pad_internal_id = pad["id"]
+    else:
+        with connect(config.database_path) as conn:
+            cursor = conn.execute(
+                "SELECT id FROM pads WHERE pad_uuid = ?",
+                (pad_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Pad not found")
+            pad_internal_id = row["id"]
 
-        # Get button action and any associated macro / application snapshot
+    # Get button action and any associated macro / application snapshot
+    with connect(config.database_path) as conn:
         cursor = conn.execute(
             """
             SELECT
@@ -857,9 +923,12 @@ class SaveConfigRequest(BaseModel):
     buttons: list[dict]  # List of button configs
     time_use_24h: bool | None = None
     time_show_am_pm: bool | None = None
+    blank_on_lock: bool | None = None
     button_count: int | None = None  # legacy single per-page count
     page_count: int | None = None
     page_button_counts: list[int] | None = None
+    layout_profiles: list[dict] | None = None
+    active_layout_profile: str | None = None
 
 
 class LogSessionResponse(BaseModel):
@@ -930,6 +999,31 @@ def save_pad_config(
         # Resolve time configuration with sane defaults
         use_24h = bool(request.time_use_24h) if request.time_use_24h is not None else False
         show_am_pm = bool(request.time_show_am_pm) if request.time_show_am_pm is not None else True
+        layout_profiles = request.layout_profiles if request.layout_profiles is not None else []
+        active_layout_profile = request.active_layout_profile
+        valid_profiles: list[dict] = []
+        active_profile_name: str | None = None
+        seen_profile_names: set[str] = set()
+        for profile in layout_profiles:
+            if not isinstance(profile, dict):
+                continue
+            raw_name = str(profile.get("name", "") or "").strip()
+            if not raw_name or raw_name in seen_profile_names:
+                continue
+            seen_profile_names.add(raw_name)
+            valid_profiles.append(profile)
+
+        if isinstance(active_layout_profile, str) and active_layout_profile.strip():
+            candidate = active_layout_profile.strip()
+            if any(str(profile.get("name", "") or "").strip() == candidate for profile in valid_profiles):
+                active_profile_name = candidate
+        if active_profile_name is None and valid_profiles:
+            active_profile_name = str(valid_profiles[0].get("name", "") or "").strip() or None
+
+        # Per-pad behavior when the Windows host session is locked. Default
+        # to True for backward compatibility so existing pads continue to
+        # blank their screens on lock until explicitly changed in the GUI.
+        blank_on_lock = bool(request.blank_on_lock) if request.blank_on_lock is not None else True
 
         print(
             f"[API] save_pad_config pad_uuid={pad_id} internal_id={pad_internal_id} "
@@ -941,6 +1035,7 @@ def save_pad_config(
         mode = "task_keypad" if request.type == "task" else "macro_keypad"
         import json as _json
         page_counts_json = _json.dumps(page_counts)
+        layout_profiles_json = _json.dumps(valid_profiles)
         conn.execute(
             """
             UPDATE pads SET
@@ -949,8 +1044,11 @@ def save_pad_config(
                 button_count = ?,
                 page_count = ?,
                 page_button_counts = ?,
+                layout_profiles = ?,
+                active_layout_profile = ?,
                 time_use_24h = ?,
-                time_show_am_pm = ?
+                time_show_am_pm = ?,
+                blank_on_lock = ?
             WHERE id = ?
             """,
             (
@@ -958,8 +1056,11 @@ def save_pad_config(
                 page_counts[0] if page_counts else 6,
                 page_count,
                 page_counts_json,
+                layout_profiles_json,
+                active_profile_name,
                 int(use_24h),
                 int(show_am_pm),
+                int(blank_on_lock),
                 pad_internal_id,
             ),
         )
@@ -993,6 +1094,7 @@ def save_pad_config(
             slot = offsets[page - 1] + local_slot
             label = btn.get("label", "")
             icon = btn.get("icon", "")
+            action_details = btn.get("action_details")
             bg_color = btn.get("bg_color")
             icon_color = btn.get("icon_color")
             text_color = btn.get("text_color")
@@ -1043,6 +1145,7 @@ def save_pad_config(
                         label = ?,
                         icon_id = ?,
                         action_id = ?,
+                        action_details = ?,
                         bg_color = ?,
                         icon_color = ?,
                         text_color = ?,
@@ -1064,6 +1167,7 @@ def save_pad_config(
                         label,
                         icon,
                         action,
+                        action_details,
                         bg_color,
                         icon_color,
                         text_color,
@@ -1092,6 +1196,7 @@ def save_pad_config(
                         label,
                         icon_id,
                         action_id,
+                        action_details,
                         enabled,
                         bg_color,
                         icon_color,
@@ -1109,7 +1214,7 @@ def save_pad_config(
                         source
                     )
                     VALUES (
-                        ?, ?, ?, ?, ?, 1, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?,
                         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                     )
                     """,
@@ -1119,6 +1224,7 @@ def save_pad_config(
                         label,
                         icon,
                         action,
+                        action_details,
                         bg_color,
                         icon_color,
                         text_color,

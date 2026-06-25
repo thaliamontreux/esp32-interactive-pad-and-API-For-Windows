@@ -1,11 +1,12 @@
 import asyncio
 import json
 from datetime import datetime, timezone
-from typing import Dict
+from typing import Any, Dict
 
 from fastapi import APIRouter, WebSocket
 
 from displaypad_server.core.config import get_config
+from displaypad_server.core.pad_runtime import reconcile_pad_runtime, set_pad_connection, update_pad_status
 from displaypad_server.db.database import connect
 
 router = APIRouter()
@@ -16,6 +17,17 @@ router = APIRouter()
 connected_pads: Dict[str, WebSocket] = {}
 
 
+async def send_json_to_pad(pad_uuid: str, message: dict[str, Any]) -> bool:
+    ws = connected_pads.get(pad_uuid)
+    if ws is None:
+        return False
+    try:
+        await ws.send_json(message)
+        return True
+    except Exception:
+        return False
+
+
 @router.websocket("/pads/{pad_id}/ws")
 async def pad_websocket(websocket: WebSocket, pad_id: str) -> None:
     await websocket.accept()
@@ -23,6 +35,7 @@ async def pad_websocket(websocket: WebSocket, pad_id: str) -> None:
 
     # Register this connection
     connected_pads[pad_id] = websocket
+    set_pad_connection(pad_id, "wifi", True)
 
     try:
         while True:
@@ -38,6 +51,9 @@ async def pad_websocket(websocket: WebSocket, pad_id: str) -> None:
             msg_type = data.get("type")
             if msg_type in {"log_session_start", "log"}:
                 _handle_log_message(pad_id, msg_type, data)
+            elif msg_type == "pad_status":
+                update_pad_status(pad_id, "wifi", data)
+                await reconcile_pad_runtime(pad_id)
     except Exception:
         # Client disconnected or receive error
         pass
@@ -49,6 +65,7 @@ async def pad_websocket(websocket: WebSocket, pad_id: str) -> None:
                 connected_pads.pop(pad_id, None)
         except Exception:
             connected_pads.pop(pad_id, None)
+        set_pad_connection(pad_id, "wifi", False)
 
 
 def _handle_log_message(pad_uuid: str, msg_type: str, data: dict) -> None:

@@ -2,6 +2,13 @@
 #include "api_client.h"
 #include "icon_cache.h"
 #include "../../../esp32_icons.h"
+#include "storage.h"
+#include "connection_mode.h"
+#include "bluetooth_manager.h"
+#include "penta_star_studios_new_png.h"
+
+#include <WiFi.h>
+#include <algorithm>
 
 #include <LittleFS.h>
 #include <PNGdec.h>
@@ -47,6 +54,54 @@ static uint8_t iconBgSampleR = 0;
 static uint8_t iconBgSampleG = 0;
 static uint8_t iconBgSampleB = 0;
 
+static void drawOrbIndicator(int cx, int cy, int radius, uint16_t fill, uint16_t border);
+static const int TOP_BAR_X = 4;
+static const int TOP_BAR_Y = 2;
+static const int TOP_BAR_W = SCREEN_WIDTH - 8;
+static const int TOP_BAR_H = 18;
+static const int PAGE_STRIP_Y = TOP_BAR_Y + TOP_BAR_H + 2;
+static const int PAGE_STRIP_H = 24;
+static const int PAGE_INDICATOR_SIZE = 18;
+static const int PAGE_INDICATOR_RADIUS = PAGE_INDICATOR_SIZE / 2;
+static const int PAGE_INDICATOR_CENTER_Y = PAGE_STRIP_Y + PAGE_INDICATOR_RADIUS + 1;
+
+static int dayOfWeek(int year, int month, int day) {
+    static const int t[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+    if (month < 3) {
+        year -= 1;
+    }
+    int w = year + year / 4 - year / 100 + year / 400 + t[month - 1] + day;
+    return w % 7;  // 0 = Sunday, 1 = Monday, ...
+}
+
+static bool isUsDstActiveForDate(const struct tm& utc) {
+    int year = utc.tm_year + 1900;
+    int month = utc.tm_mon + 1;  // 1-12
+    int day = utc.tm_mday;
+
+    if (month < 3 || month > 11) {
+        return false;
+    }
+    if (month > 3 && month < 11) {
+        return true;
+    }
+
+    if (month == 3) {
+        int dowMar1 = dayOfWeek(year, 3, 1);  // 0 = Sunday
+        int firstSunday = 1 + ((7 - dowMar1) % 7);
+        int secondSunday = firstSunday + 7;
+        return day > secondSunday;
+    }
+
+    if (month == 11) {
+        int dowNov1 = dayOfWeek(year, 11, 1);
+        int firstSunday = 1 + ((7 - dowNov1) % 7);
+        return day < firstSunday;
+    }
+
+    return false;
+}
+
 // PNGdec filesystem callbacks (adapted from TFT_eSPI LittleFS_PNG example)
 void* pngOpen(const char* filename, int32_t* size) {
     Serial.print("[PNGdec] pngOpen filename='");
@@ -81,6 +136,48 @@ int32_t pngSeek(PNGFILE* page, int32_t position) {
     (void)page;  // unused
     if (!pngfile) return 0;
     return pngfile.seek(position);
+}
+
+// PNGdec callbacks for the embedded lock-screen PNG. These read directly from
+// the PentaStarStudiosPng byte array in flash, so they do not depend on
+// LittleFS at all and cannot fail due to filesystem space constraints.
+static int32_t g_lockPngPos = 0;
+
+void* pngOpenLock(const char* filename, int32_t* size) {
+    (void)filename;
+    g_lockPngPos = 0;
+    *size = (int32_t)PentaStarStudiosNewPngSize;
+    return (void*)1;  // dummy non-null handle
+}
+
+void pngCloseLock(void* handle) {
+    (void)handle;
+}
+
+int32_t pngReadLock(PNGFILE* page, uint8_t* buffer, int32_t length) {
+    (void)page;
+    int32_t remaining = (int32_t)PentaStarStudiosNewPngSize - g_lockPngPos;
+    if (remaining <= 0) {
+        return 0;
+    }
+    if (length > remaining) {
+        length = remaining;
+    }
+    memcpy(buffer, PentaStarStudiosNewPng + g_lockPngPos, length);
+    g_lockPngPos += length;
+    return length;
+}
+
+int32_t pngSeekLock(PNGFILE* page, int32_t position) {
+    (void)page;
+    if (position < 0) {
+        position = 0;
+    }
+    if (position > (int32_t)PentaStarStudiosNewPngSize) {
+        position = (int32_t)PentaStarStudiosNewPngSize;
+    }
+    g_lockPngPos = position;
+    return g_lockPngPos;
 }
 
 // First-pass PNG callback: analyze pixels as RGBA to detect icon type and build statistics.
@@ -220,6 +317,121 @@ static const Esp32Icon* findEsp32Icon(const String& id) {
     return nullptr;
 }
 
+
+void ButtonRenderer::showHostLockScreen() {
+    display.clear();
+    display.fillScreen(COLOR_BG_DARK);
+    needsFullSurfaceClear = true;
+    display.fillRect(0, 0, SCREEN_WIDTH, 18, COLOR_BG_DARKER);
+    display.fillRect(0, SCREEN_HEIGHT - 36, SCREEN_WIDTH, 36, COLOR_BG_DARKER);
+    display.drawLine(0, 0, SCREEN_WIDTH, 0, COLOR_NEON_PURPLE);
+    display.drawLine(0, 17, SCREEN_WIDTH, 17, COLOR_NEON_CYAN);
+    display.drawLine(0, SCREEN_HEIGHT - 37, SCREEN_WIDTH, SCREEN_HEIGHT - 37, COLOR_NEON_PURPLE);
+
+    drawOrbIndicator(16, 9, 6, COLOR_NEON_PURPLE, COLOR_NEON_CYAN);
+    display.setTextSize(1);
+    display.setTextDatum(ML_DATUM);
+    display.setTextColor(COLOR_WHITE, COLOR_BG_DARKER);
+    display.drawString("HOST LOCKED", 28, 9);
+
+    // The lock-screen image is provided as an embedded PNG in firmware and
+    // decoded directly from flash using dedicated PNGdec callbacks so that
+    // BLE-only pads never require WiFi or LittleFS space to display it.
+    Serial.println("[ButtonRenderer] Rendering embedded host lock screen");
+
+    int16_t innerX = 10;
+    int16_t innerY = 24;
+    int16_t innerW = display.width() - 20;
+    int16_t innerH = display.height() - 72;
+
+    if (innerW <= 0 || innerH <= 0) {
+        return;
+    }
+
+    display.fillRoundRect(innerX - 4, innerY - 4, innerW + 8, innerH + 8, 10, COLOR_BG_MID);
+    display.fillRoundRect(innerX - 2, innerY - 2, innerW + 4, innerH + 4, 8, COLOR_BG_DARK);
+    display.drawRoundRect(innerX - 4, innerY - 4, innerW + 8, innerH + 8, 10, COLOR_NEON_PURPLE);
+    display.drawRoundRect(innerX - 2, innerY - 2, innerW + 4, innerH + 4, 8, COLOR_NEON_CYAN);
+
+    // Reset global PNG state for this decode.
+    iconBgColor = COLOR_BLACK;
+    iconFgColor = COLOR_BLACK;
+    iconBgSampled = false;
+    iconTransparentCount = 0;
+    iconSemiTransparentCount = 0;
+    iconDarkCount = 0;
+    iconWhiteCount = 0;
+    iconOtherCount = 0;
+
+    int16_t analyzeOpen = png.open("embedded_lock", pngOpenLock, pngCloseLock, pngReadLock, pngSeekLock, pngDrawAnalyze);
+    if (analyzeOpen != PNG_SUCCESS) {
+        Serial.print("[ButtonRenderer] PNG open (analyze) failed for embedded lock screen rc=");
+        Serial.println(analyzeOpen);
+        return;
+    }
+
+    iconSrcW = png.getWidth();
+    iconSrcH = png.getHeight();
+    if (iconSrcW <= 0 || iconSrcH <= 0) {
+        png.close();
+        return;
+    }
+
+    // Analyze pass
+    png.decode(nullptr, 0);
+
+    // Compute scaled draw size preserving aspect ratio
+    int32_t scaleW = (int32_t)innerW * 1000 / iconSrcW;
+    int32_t scaleH = (int32_t)innerH * 1000 / iconSrcH;
+    int32_t scale = scaleW < scaleH ? scaleW : scaleH;
+    if (scale <= 0) scale = 1;
+    if (scale > 1000) scale = 1000;
+    iconDrawW = (int16_t)(iconSrcW * scale / 1000);
+    iconDrawH = (int16_t)(iconSrcH * scale / 1000);
+
+    if (iconDrawW <= 0 || iconDrawH <= 0) {
+        png.close();
+        return;
+    }
+
+    iconX = innerX + (innerW - iconDrawW) / 2;
+    iconY = innerY + (innerH - iconDrawH) / 2;
+
+    // Re-open and render the PNG using the existing pngDrawRender callback.
+    png.close();
+    int16_t renderOpen = png.open("embedded_lock", pngOpenLock, pngCloseLock, pngReadLock, pngSeekLock, pngDrawRender);
+    if (renderOpen != PNG_SUCCESS) {
+        Serial.print("[ButtonRenderer] PNG open (render) failed for embedded lock screen rc=");
+        Serial.println(renderOpen);
+        png.close();
+        return;
+    }
+
+    png.decode(nullptr, 0);
+    png.close();
+
+    display.drawRoundRect(innerX - 4, innerY - 4, innerW + 8, innerH + 8, 10, COLOR_NEON_PURPLE);
+    display.drawRoundRect(innerX - 2, innerY - 2, innerW + 4, innerH + 4, 8, COLOR_NEON_CYAN);
+
+    display.fillRoundRect(12, SCREEN_HEIGHT - 30, SCREEN_WIDTH - 24, 20, 8, COLOR_BG_MID);
+    display.drawRoundRect(12, SCREEN_HEIGHT - 30, SCREEN_WIDTH - 24, 20, 8, COLOR_NEON_YELLOW);
+    drawOrbIndicator(26, SCREEN_HEIGHT - 20, 5, COLOR_NEON_YELLOW, COLOR_WHITE);
+    display.setTextDatum(ML_DATUM);
+    display.setTextColor(COLOR_WHITE, COLOR_BG_MID);
+    display.drawString("Waiting for your PC to unlock", 38, SCREEN_HEIGHT - 20);
+
+    extern SecureStorage storage;
+    String host = storage.getApiHost();
+    if (host.length() > 0) {
+        if (host.length() > 22) {
+            host = host.substring(0, 19) + "...";
+        }
+        display.setTextDatum(MR_DATUM);
+        display.setTextColor(COLOR_NEON_CYAN, COLOR_BG_DARKER);
+        display.drawString(host, SCREEN_WIDTH - 8, 9);
+    }
+}
+
 static bool drawEsp32Icon(const Button& btn, uint16_t faceColor) {
     (void)faceColor;
 
@@ -294,11 +506,14 @@ ButtonRenderer::ButtonRenderer()
       timezoneOffsetMinutes(0),
       currentPage(1),
       totalPages(1),
-      buttonsPerPage(0) {}
+      buttonsPerPage(0),
+      isTaskKeypadMode(false),
+      needsFullSurfaceClear(true) {}
 
 bool ButtonRenderer::begin() {
     // Clear to a dark industrial background when the renderer initializes
     display.fillScreen(COLOR_BG_DARK);
+    needsFullSurfaceClear = true;
     return true;
 }
 
@@ -344,13 +559,65 @@ static uint16_t hexToRgb565(const String& hex, uint16_t fallback) {
     return (r5 << 11) | (g6 << 5) | b5;
 }
 
+static uint16_t blend565(uint16_t from, uint16_t to, uint8_t amount) {
+    uint16_t fr = (from >> 11) & 0x1F;
+    uint16_t fg = (from >> 5) & 0x3F;
+    uint16_t fb = from & 0x1F;
+    uint16_t tr = (to >> 11) & 0x1F;
+    uint16_t tg = (to >> 5) & 0x3F;
+    uint16_t tb = to & 0x1F;
+
+    uint16_t rr = (uint16_t)((fr * (255 - amount) + tr * amount) / 255);
+    uint16_t rg = (uint16_t)((fg * (255 - amount) + tg * amount) / 255);
+    uint16_t rb = (uint16_t)((fb * (255 - amount) + tb * amount) / 255);
+    return (rr << 11) | (rg << 5) | rb;
+}
+
+static uint16_t lighten565(uint16_t color, uint8_t amount) {
+    return blend565(color, COLOR_WHITE, amount);
+}
+
+static uint16_t darken565(uint16_t color, uint8_t amount) {
+    return blend565(color, COLOR_BLACK, amount);
+}
+
+static uint8_t pulseAmount(uint8_t maxAmount, unsigned long periodMs = 1200) {
+    if (maxAmount == 0 || periodMs < 2) {
+        return 0;
+    }
+    unsigned long half = periodMs / 2;
+    unsigned long phase = millis() % periodMs;
+    unsigned long ramp = phase <= half ? phase : (periodMs - phase);
+    return (uint8_t)((ramp * maxAmount) / half);
+}
+
+static void drawOrbIndicator(int cx, int cy, int radius, uint16_t fill, uint16_t border) {
+    uint16_t shadow = darken565(fill, 170);
+    uint16_t shell = darken565(fill, 70);
+    uint16_t core = lighten565(fill, 35);
+    uint16_t gleam = lighten565(fill, 145);
+
+    display.fillCircle(cx + 1, cy + 1, radius + 1, shadow);
+    display.fillCircle(cx, cy, radius, shell);
+    if (radius > 1) {
+        display.fillCircle(cx, cy, radius - 1, core);
+    }
+    display.drawCircle(cx, cy, radius, border);
+    if (radius > 2) {
+        display.fillCircle(cx - 1, cy - 1, radius / 2, gleam);
+    }
+}
+
 void ButtonRenderer::loadConfig(const PadConfig& config) {
     buttons.clear();
+    needsFullSurfaceClear = true;
 
-    // Capture time configuration for taskbar
+    // Capture time display preferences for taskbar. The actual clock value
+    // is synced directly from the host (local time), so we do not apply any
+    // additional timezone offsets here.
     use24hFormat = config.use24h;
     showAmPm = config.showAmPm;
-    timezoneOffsetMinutes = config.timezoneOffsetMinutes;
+    timezoneOffsetMinutes = 0;
 
     // Track whether this pad is currently in Task Keypad mode. In this
     // mode we will only render buttons whose associated applications are
@@ -432,6 +699,11 @@ void ButtonRenderer::loadConfig(const PadConfig& config) {
 
 void ButtonRenderer::clearButtons() {
     buttons.clear();
+    needsFullSurfaceClear = true;
+}
+
+void ButtonRenderer::invalidateLayout() {
+    needsFullSurfaceClear = true;
 }
 
 void ButtonRenderer::clearTaskAppState() {
@@ -448,19 +720,58 @@ void ButtonRenderer::setTaskAppRunning(int slot, bool running) {
     }
 }
 
-void ButtonRenderer::forceRefresh() {
-    // Redraw industrial-style background before everything
-    display.fillScreen(COLOR_BG_DARK);
-    drawTaskbar();
-    drawPageIndicators();
-    if (isTaskKeypadMode) {
-        // In Task Keypad mode, render running applications packed from
-        // left-to-right using the first N layout slots on the current page,
-        // so there are no visual gaps when some apps are not running.
-        // The underlying button configuration (slots, actions) is preserved;
-        // this only affects where the icons are drawn.
+std::vector<int> ButtonRenderer::getPressedSlots() const {
+    std::vector<int> pressedSlots;
+    for (const auto &btn : buttons) {
+        if (btn.pressed) {
+            pressedSlots.push_back(btn.slot);
+        }
+    }
+    return pressedSlots;
+}
 
-        // Build an ordered list of layout slots (positions) for this page.
+std::vector<int> ButtonRenderer::getActiveTaskSlots() const {
+    std::vector<int> activeSlots;
+    for (const auto &btn : buttons) {
+        if (btn.taskAppRunning) {
+            activeSlots.push_back(btn.slot);
+        }
+    }
+    return activeSlots;
+}
+
+void ButtonRenderer::clearButtonRegion(const Button& btn) {
+    int x = btn.x - 4;
+    int y = btn.y - 4;
+    int w = btn.w + 8;
+    int h = btn.h + 10;
+    if (x < 0) {
+        w += x;
+        x = 0;
+    }
+    if (y < 0) {
+        h += y;
+        y = 0;
+    }
+    if (x + w > SCREEN_WIDTH) {
+        w = SCREEN_WIDTH - x;
+    }
+    if (y + h > SCREEN_HEIGHT) {
+        h = SCREEN_HEIGHT - y;
+    }
+    if (w > 0 && h > 0) {
+        display.fillRect(x, y, w, h, COLOR_BG_DARK);
+    }
+}
+
+void ButtonRenderer::clearAllButtonRegions() {
+    for (const auto &btn : buttons) {
+        clearButtonRegion(btn);
+    }
+}
+
+void ButtonRenderer::drawCurrentPageButtons() {
+    if (isTaskKeypadMode) {
         std::vector<const Button*> layoutSlots;
         layoutSlots.reserve(buttons.size());
         for (const auto &btn : buttons) {
@@ -469,8 +780,6 @@ void ButtonRenderer::forceRefresh() {
             }
         }
 
-        // Build the list of buttons whose applications are currently running
-        // on this page.
         std::vector<const Button*> runningButtons;
         runningButtons.reserve(layoutSlots.size());
         for (const auto &btn : buttons) {
@@ -480,9 +789,6 @@ void ButtonRenderer::forceRefresh() {
         }
 
         if (!layoutSlots.empty() && !runningButtons.empty()) {
-            // Sort layout slots by their configured slot number so that we
-            // fill positions from left-to-right/top-to-bottom as defined by
-            // the server layout.
             std::sort(
                 layoutSlots.begin(),
                 layoutSlots.end(),
@@ -499,46 +805,65 @@ void ButtonRenderer::forceRefresh() {
             for (size_t i = 0; i < count; ++i) {
                 const Button* content = runningButtons[i];
                 const Button* layout = layoutSlots[i];
-
-                // Draw a temporary button that uses the visual position and
-                // size from the i-th layout slot, but all other properties
-                // (label, icon, action, etc.) from the running button.
                 Button drawBtn = *content;
                 drawBtn.x = layout->x;
                 drawBtn.y = layout->y;
                 drawBtn.w = layout->w;
                 drawBtn.h = layout->h;
-
                 drawButton(drawBtn, content->pressed);
             }
         }
-    } else {
-        for (size_t i = 0; i < buttons.size(); i++) {
-            if (buttons[i].page == currentPage) {
-                renderButton(i);
-            }
+        return;
+    }
+
+    for (size_t i = 0; i < buttons.size(); i++) {
+        if (buttons[i].page == currentPage) {
+            renderButton(i);
         }
     }
 }
 
+void ButtonRenderer::clearPageIndicatorArea() {
+    display.fillRect(0, PAGE_STRIP_Y, SCREEN_WIDTH, PAGE_STRIP_H, COLOR_BG_DARK);
+}
+
+void ButtonRenderer::forceRefresh() {
+    // Redraw industrial-style background before everything
+    if (needsFullSurfaceClear) {
+        display.fillScreen(COLOR_BG_DARK);
+        needsFullSurfaceClear = false;
+    }
+    drawTaskbar();
+    drawPageIndicators();
+    clearAllButtonRegions();
+    drawCurrentPageButtons();
+}
+
 void ButtonRenderer::drawTaskbar() {
-    // 16px height taskbar at top with cyberpunk styling
-    const int taskbarHeight = 16;
-    const int iconSize = 14;  // 14px config icon
+    const int iconSize = 14;
+    uint16_t barOuter = COLOR_BG_MID;
+    uint16_t barInner = blend565(COLOR_BG_DARKER, COLOR_BG_MID, 28);
+    uint16_t barTop = blend565(COLOR_BG_DARKER, COLOR_NEON_PURPLE, 36);
 
-    // Taskbar background: dark panel with a subtle top/bottom stripe
-    display.fillRect(0, 0, SCREEN_WIDTH, taskbarHeight, COLOR_BG_DARKER);
-    display.drawLine(0, 0, SCREEN_WIDTH, 0, COLOR_NEON_PURPLE);
-    display.drawLine(0, taskbarHeight - 1, SCREEN_WIDTH, taskbarHeight - 1, COLOR_NEON_CYAN);
+    display.fillRect(0, 0, SCREEN_WIDTH, TOP_BAR_Y + TOP_BAR_H + 2, COLOR_BG_DARK);
+    display.fillRoundRect(TOP_BAR_X, TOP_BAR_Y, TOP_BAR_W, TOP_BAR_H, 6, barOuter);
+    display.fillRoundRect(TOP_BAR_X + 1, TOP_BAR_Y + 1, TOP_BAR_W - 2, TOP_BAR_H - 2, 5, barInner);
+    display.fillRoundRect(TOP_BAR_X + 2, TOP_BAR_Y + 2, TOP_BAR_W - 4, 5, 4, barTop);
+    display.drawRoundRect(TOP_BAR_X, TOP_BAR_Y, TOP_BAR_W, TOP_BAR_H, 6, lighten565(COLOR_NEON_PURPLE, 60));
+    display.drawRoundRect(TOP_BAR_X + 1, TOP_BAR_Y + 1, TOP_BAR_W - 2, TOP_BAR_H - 2, 5, COLOR_NEON_CYAN);
 
-    // Draw time on the left (small text, 12/24-hour per config). NTP is
-    // configured with UTC (offset 0), so time() returns UTC. Apply the
-    // server's timezone offset from the pad config so the ESP32 clock matches
-    // the DisplayPad API host.
+    // Draw time on the left (small text, 12/24-hour per config). The ESP32
+    // system clock is kept in sync directly from the host's current wall
+    // clock (via BLE or API), so we treat time() as already being in the
+    // host's local timezone and do not apply any extra timezone or DST
+    // adjustments here.
     time_t now = time(nullptr);
     if (now > 0) {
-        time_t adjusted = now + (time_t)timezoneOffsetMinutes * 60;
-        struct tm* timeinfo = gmtime(&adjusted);
+        struct tm* timeinfo = gmtime(&now);
+        if (!timeinfo) {
+            return;
+        }
+
         int hour24 = timeinfo->tm_hour;
         int minute = timeinfo->tm_min;
 
@@ -568,9 +893,9 @@ void ButtonRenderer::drawTaskbar() {
         }
 
         display.setTextSize(1);
-        display.setTextDatum(ML_DATUM);  // middle-left
-        display.setTextColor(COLOR_NEON_CYAN, COLOR_BG_DARKER);
-        display.drawString(timeStr, 2, taskbarHeight / 2);
+        display.setTextDatum(ML_DATUM);
+        display.setTextColor(lighten565(COLOR_NEON_CYAN, 80), barInner);
+        display.drawString(timeStr, TOP_BAR_X + 6, TOP_BAR_Y + TOP_BAR_H / 2);
     }
 
     // Host name in the center (API host from storage)
@@ -579,46 +904,108 @@ void ButtonRenderer::drawTaskbar() {
     if (host.length() > 0) {
         display.setTextSize(1);
         display.setTextDatum(MC_DATUM);
-        display.setTextColor(COLOR_WHITE, COLOR_DARK_GRAY);
+        display.setTextColor(lighten565(COLOR_WHITE, 10), barInner);
 
-        // Constrain host name width so it doesn't collide with time or icon
-        int leftReserved = 40;   // space for time text
-        int rightReserved = 24;  // space for config icon
+        // Constrain host name width so it doesn't collide with time or icons
+        int leftReserved = 48;   // space for time text
+        int rightReserved = 56;  // space for config icon + status dots
         int maxHostWidth = SCREEN_WIDTH - leftReserved - rightReserved - 4;
         while (display.textWidth(host) > maxHostWidth && host.length() > 0) {
             host.remove(host.length() - 1);
         }
 
-        display.drawString(host, SCREEN_WIDTH / 2, taskbarHeight / 2);
+        display.drawString(host, SCREEN_WIDTH / 2, TOP_BAR_Y + TOP_BAR_H / 2);
     }
 
+    // Connection status indicators just left of the config icon. In WiFi
+    // modes we show WiFi/API dots; in Bluetooth mode we show RX/TX activity
+    // indicators driven by BLE traffic.
+    const int statusRadius = 3;
+    const int statusSpacing = 2;
+    const int statusY = TOP_BAR_Y + TOP_BAR_H / 2;
+
+    ConnectionMode mode = getConnectionMode();
+
     // Draw config gear icon at right side (14x14 area)
-    int iconRight = SCREEN_WIDTH - 2;
+    int iconRight = TOP_BAR_X + TOP_BAR_W - 5;
     int iconLeft = iconRight - iconSize + 1;
-    int iconTop = 1;
+    int iconTop = TOP_BAR_Y + (TOP_BAR_H - iconSize) / 2;
     int iconBottom = iconTop + iconSize - 1;
     int cx = (iconLeft + iconRight) / 2;
     int cy = (iconTop + iconBottom) / 2;
 
-    int radius = iconSize / 2 - 1;  // keep inside 14px box
-    // Neon gear "orb"
-    display.fillCircle(cx, cy, radius - 2, COLOR_NEON_PURPLE);
-    display.drawCircle(cx, cy, radius, COLOR_NEON_CYAN);
+    if (mode == ConnectionMode::BLUETOOTH) {
+        // BLE RX/TX indicators: two dots labelled RX and TX. Dots turn green
+        // briefly when traffic is seen, red when idle.
+        unsigned long nowMs = millis();
+        const unsigned long ACTIVE_WINDOW_MS = 1000;  // 1s activity window
+
+        unsigned long lastRx = btManager.getLastRxActivityMs();
+        unsigned long lastTx = btManager.getLastTxActivityMs();
+
+        bool rxActive = (lastRx != 0) && (nowMs - lastRx < ACTIVE_WINDOW_MS);
+        bool txActive = (lastTx != 0) && (nowMs - lastTx < ACTIVE_WINDOW_MS);
+
+        uint16_t rxColor = rxActive ? COLOR_GREEN : COLOR_RED;
+        uint16_t txColor = txActive ? COLOR_GREEN : COLOR_RED;
+
+        int txX = iconLeft - 4 - statusRadius;                   // closest to gear
+        int rxX = txX - (statusRadius * 2 + statusSpacing);       // to the left
+
+        drawOrbIndicator(rxX, statusY, statusRadius, rxColor, lighten565(rxColor, 60));
+        drawOrbIndicator(txX, statusY, statusRadius, txColor, lighten565(txColor, 60));
+
+        // Tiny labels 'R' and 'T' above the dots for clarity.
+        display.setTextSize(1);
+        display.setTextDatum(BC_DATUM);
+        display.setTextColor(COLOR_WHITE, barInner);
+        display.drawString("R", rxX, statusY - statusRadius - 1);
+        display.drawString("T", txX, statusY - statusRadius - 1);
+    } else {
+        bool wifiConnected = (WiFi.status() == WL_CONNECTED);
+        bool apiConnected = apiClient.isWebSocketConnected();
+
+        uint16_t wifiColor = wifiConnected ? COLOR_GREEN : COLOR_RED;
+
+        uint16_t apiColor;
+        if (wifiConnected && !apiConnected) {
+            // WiFi is up but API/WebSocket is down: flash yellow to indicate
+            // we are attempting to (re)connect.
+            unsigned long ms = millis();
+            bool phaseOn = ((ms / 500) % 2) == 0;  // 500ms on/off
+            apiColor = phaseOn ? COLOR_YELLOW : COLOR_DARK_GRAY;
+        } else {
+            // Normal states: green when connected, red when disconnected.
+            apiColor = apiConnected ? COLOR_GREEN : COLOR_RED;
+        }
+
+        // Draw API status dot closest to gear
+        int apiX = iconLeft - 4 - statusRadius;  // 4px gap from gear
+        drawOrbIndicator(apiX, statusY, statusRadius, apiColor, lighten565(apiColor, 60));
+
+        int wifiX = apiX - (statusRadius * 2 + statusSpacing);
+        drawOrbIndicator(wifiX, statusY, statusRadius, wifiColor, lighten565(wifiColor, 60));
+    }
+
+    int radius = iconSize / 2 - 1;
+    drawOrbIndicator(cx, cy, radius, COLOR_NEON_PURPLE, COLOR_NEON_CYAN);
+    display.fillCircle(cx, cy, radius - 4, lighten565(COLOR_NEON_PURPLE, 55));
+    display.drawCircle(cx, cy, radius - 2, lighten565(COLOR_NEON_CYAN, 70));
 }
 
 void ButtonRenderer::drawPageIndicators() {
+    clearPageIndicatorArea();
     if (totalPages <= 1) {
-        return;  // nothing to show
+        return;
     }
 
-    const int taskbarHeight = 16;
-    const int indicatorSize = 18;
-    const int radius = indicatorSize / 2;
-    const int centerY = taskbarHeight + radius + 1;  // just below the top bar
+    const int indicatorSize = PAGE_INDICATOR_SIZE;
+    const int radius = PAGE_INDICATOR_RADIUS;
+    const int centerY = PAGE_INDICATOR_CENTER_Y;
 
     int pagesToShow = totalPages;
     if (pagesToShow > 4) {
-        pagesToShow = 4;  // currently support up to 4 visual indicators
+        pagesToShow = 4;
     }
 
     int totalWidth = pagesToShow * indicatorSize + (pagesToShow - 1) * 6;
@@ -629,14 +1016,12 @@ void ButtonRenderer::drawPageIndicators() {
         int cx = startX + i * (indicatorSize + 6);
 
         bool active = (page == currentPage);
-        uint16_t fill = active ? COLOR_NEON_CYAN : COLOR_BG_DARKER;
+        uint16_t fill = active ? COLOR_NEON_CYAN : blend565(COLOR_BG_DARKER, COLOR_NEON_PURPLE, 36);
         uint16_t border = active ? COLOR_NEON_YELLOW : COLOR_NEON_PURPLE;
-        uint16_t text = active ? COLOR_BG_DARKER : COLOR_NEON_CYAN;
+        uint16_t text = active ? COLOR_BLACK : lighten565(COLOR_NEON_CYAN, 80);
 
-        display.fillCircle(cx, centerY, radius, fill);
-        display.drawCircle(cx, centerY, radius, border);
+        drawOrbIndicator(cx, centerY, radius, fill, border);
 
-        // Draw page number in the center
         display.setTextSize(1);
         display.setTextDatum(MC_DATUM);
         display.setTextColor(text, fill);
@@ -646,12 +1031,11 @@ void ButtonRenderer::drawPageIndicators() {
 
 bool ButtonRenderer::checkTaskbarTouch(int x, int y) {
     // Hit-test for config icon in 16px-high taskbar at top
-    const int taskbarHeight = 16;
     const int iconSize = 14;
 
-    int iconRight = SCREEN_WIDTH - 2;
+    int iconRight = TOP_BAR_X + TOP_BAR_W - 5;
     int iconLeft = iconRight - iconSize + 1;
-    int iconTop = 1;
+    int iconTop = TOP_BAR_Y + (TOP_BAR_H - iconSize) / 2;
     int iconBottom = iconTop + iconSize - 1;
 
     if (y >= iconTop && y <= iconBottom && x >= iconLeft && x <= iconRight) {
@@ -663,85 +1047,7 @@ bool ButtonRenderer::checkTaskbarTouch(int x, int y) {
 }
 
 void ButtonRenderer::render() {
-    // Only clear and draw on first render or when buttons change
-    static bool firstRender = true;
-    if (firstRender) {
-        display.fillScreen(COLOR_BG_DARK);
-        drawTaskbar();
-        drawPageIndicators();
-        firstRender = false;
-    }
-
-    if (isTaskKeypadMode) {
-        // In Task Keypad mode, render running applications packed from
-        // left-to-right using the first N layout slots on the current page,
-        // so there are no visual gaps when some apps are not running.
-        // The underlying button configuration (slots, actions) is preserved;
-        // this only affects where the icons are drawn.
-
-        // Build an ordered list of layout slots (positions) for this page.
-        std::vector<const Button*> layoutSlots;
-        layoutSlots.reserve(buttons.size());
-        for (const auto &btn : buttons) {
-            if (btn.page == currentPage) {
-                layoutSlots.push_back(&btn);
-            }
-        }
-
-        // Build the list of buttons whose applications are currently running
-        // on this page.
-        std::vector<const Button*> runningButtons;
-        runningButtons.reserve(layoutSlots.size());
-        for (const auto &btn : buttons) {
-            if (btn.page == currentPage && btn.taskAppRunning) {
-                runningButtons.push_back(&btn);
-            }
-        }
-
-        if (!layoutSlots.empty() && !runningButtons.empty()) {
-            // Sort layout slots by their configured slot number so that we
-            // fill positions from left-to-right/top-to-bottom as defined by
-            // the server layout.
-            std::sort(
-                layoutSlots.begin(),
-                layoutSlots.end(),
-                [](const Button* a, const Button* b) {
-                    return a->slot < b->slot;
-                }
-            );
-
-            size_t count = runningButtons.size();
-            if (count > layoutSlots.size()) {
-                count = layoutSlots.size();
-            }
-
-            for (size_t i = 0; i < count; ++i) {
-                const Button* content = runningButtons[i];
-                const Button* layout = layoutSlots[i];
-
-                // Draw a temporary button that uses the visual position and
-                // size from the i-th layout slot, but all other properties
-                // (label, icon, action, etc.) from the running button.
-                Button drawBtn = *content;
-                drawBtn.x = layout->x;
-                drawBtn.y = layout->y;
-                drawBtn.w = layout->w;
-                drawBtn.h = layout->h;
-
-                drawButton(drawBtn, content->pressed);
-            }
-        }
-    } else {
-        for (size_t i = 0; i < buttons.size(); i++) {
-            if (buttons[i].page == currentPage) {
-                renderButton(i);
-            }
-        }
-    }
-
-    // Redraw taskbar and page indicators (to update time and highlight)
-    drawTaskbar();
-    drawPageIndicators();
+    forceRefresh();
 }
 
 void ButtonRenderer::drawResetButton() {
@@ -771,32 +1077,99 @@ void ButtonRenderer::renderButton(int index) {
 }
 
 void ButtonRenderer::renderButton(const Button& btn) {
+    clearButtonRegion(btn);
     drawButton(btn, btn.pressed);
 }
 
 void ButtonRenderer::drawButton(const Button& btn, bool highlight) {
-    uint16_t baseColor = highlight ? COLOR_NEON_YELLOW : btn.bgColor;
-    uint16_t edgeColor = highlight ? COLOR_NEON_CYAN : COLOR_NEON_PURPLE;
-    // Use the same base button background color for the inner face so any
-    // transparent pixels in the icon (which use faceColor) blend perfectly
-    // with the button and do not appear as a darker box.
-    uint16_t faceColor = highlight ? COLOR_NEON_CYAN : btn.bgColor;
-
-    // Simple drop shadow (offset down-right)
     int r = 8;
-    int shadowOffset = 2;
-    display.fillRoundRect(btn.x + shadowOffset, btn.y + shadowOffset,
-                          btn.w, btn.h, r, COLOR_BG_DARKER);
+    int pressOffsetY = highlight ? 1 : 0;
+    int shadowOffsetX = highlight ? 1 : 3;
+    int shadowOffsetY = highlight ? 2 : 4;
+    uint8_t flash = highlight ? pulseAmount(56, 420) : 0;
 
-    // Button base
-    display.fillRoundRect(btn.x, btn.y, btn.w, btn.h, r, baseColor);
+    uint16_t shellColor = highlight
+        ? blend565(btn.bgColor, COLOR_NEON_CYAN, 120 + flash / 3)
+        : darken565(btn.bgColor, 30);
+    uint16_t faceTop = highlight
+        ? blend565(btn.bgColor, COLOR_WHITE, 120 + flash / 3)
+        : lighten565(btn.bgColor, 78);
+    uint16_t faceMid = highlight
+        ? blend565(btn.bgColor, COLOR_NEON_CYAN, 70 + flash / 4)
+        : lighten565(btn.bgColor, 26);
+    uint16_t faceBottom = highlight
+        ? darken565(blend565(btn.bgColor, COLOR_NEON_PURPLE, 70), 20)
+        : darken565(btn.bgColor, 42);
+    uint16_t faceColor = faceMid;
+    uint16_t outerBorder = highlight
+        ? lighten565(COLOR_NEON_CYAN, flash / 2)
+        : blend565(btn.bgColor, COLOR_NEON_PURPLE, 96);
+    uint16_t innerBorder = highlight
+        ? lighten565(COLOR_NEON_YELLOW, flash / 3)
+        : lighten565(btn.bgColor, 96);
+    uint16_t shadowColorFar = darken565(btn.bgColor, 190);
+    uint16_t shadowColorNear = darken565(btn.bgColor, 125);
+    uint16_t glossColor = highlight
+        ? lighten565(COLOR_NEON_CYAN, 120 + flash / 3)
+        : lighten565(btn.bgColor, 150);
+    uint16_t lowlightColor = darken565(btn.bgColor, 120);
 
-    // Inner face to simulate 3D inset
-    display.fillRoundRect(btn.x + 2, btn.y + 2, btn.w - 4, btn.h - 4,
-                          r - 2, faceColor);
+    display.fillRoundRect(btn.x + shadowOffsetX, btn.y + shadowOffsetY,
+                          btn.w, btn.h, r, shadowColorFar);
+    display.fillRoundRect(btn.x + (shadowOffsetX > 1 ? shadowOffsetX - 1 : shadowOffsetX),
+                          btn.y + (shadowOffsetY > 1 ? shadowOffsetY - 1 : shadowOffsetY),
+                          btn.w, btn.h, r, shadowColorNear);
 
-    // Bright top/left edge, darker bottom/right edge for 3D effect
-    display.drawRoundRect(btn.x, btn.y, btn.w, btn.h, r, edgeColor);
+    int shellX = btn.x;
+    int shellY = btn.y + pressOffsetY;
+    display.fillRoundRect(shellX, shellY, btn.w, btn.h, r, shellColor);
+
+    int faceX = shellX + 2;
+    int faceY = shellY + 2;
+    int faceW = btn.w - 4;
+    int faceH = btn.h - 4;
+    int faceR = r - 2;
+
+    if (faceW > 0 && faceH > 0) {
+        display.fillRoundRect(faceX, faceY, faceW, faceH, faceR, faceBottom);
+
+        int midH = (faceH * 62) / 100;
+        if (midH < 4) midH = faceH;
+        display.fillRoundRect(faceX + 1, faceY + 1, faceW - 2, faceH - 2, faceR > 1 ? faceR - 1 : 1, faceMid);
+        if (midH > 2 && faceW > 6) {
+            display.fillRoundRect(faceX + 2, faceY + 1, faceW - 4, midH, faceR > 2 ? faceR - 2 : 1, faceTop);
+        }
+
+        int glossW = faceW - 12;
+        if (glossW > 6) {
+            int glossH = faceH > 24 ? 7 : 5;
+            display.fillRoundRect(faceX + 4, faceY + 3, glossW, glossH, glossH / 2, glossColor);
+        }
+
+        if (highlight) {
+            int flashW = faceW - 18;
+            if (flashW > 8) {
+                uint16_t flashColor = lighten565(COLOR_NEON_CYAN, 145 + flash / 4);
+                display.fillRoundRect(faceX + 9, faceY + faceH / 2 - 2, flashW, 4, 2, flashColor);
+            }
+        }
+
+        display.drawRoundRect(shellX, shellY, btn.w, btn.h, r, outerBorder);
+        display.drawRoundRect(faceX, faceY, faceW, faceH, faceR, innerBorder);
+
+        int innerTopY = faceY + 2;
+        int innerBottomY = faceY + faceH - 3;
+        if (innerBottomY > innerTopY) {
+            display.drawLine(faceX + 4, innerTopY, faceX + faceW - 5, innerTopY, glossColor);
+            display.drawLine(faceX + 4, innerBottomY, faceX + faceW - 5, innerBottomY, lowlightColor);
+        }
+    } else {
+        display.drawRoundRect(shellX, shellY, btn.w, btn.h, r, outerBorder);
+    }
+
+    Button contentBtn = btn;
+    contentBtn.x = shellX;
+    contentBtn.y = shellY;
 
     bool iconDrawn = false;
 
@@ -806,18 +1179,18 @@ void ButtonRenderer::drawButton(const Button& btn, bool highlight) {
         // Determine the local cache key for this application's PNG icon.
         // applicationIconKey may include a version/hash suffix so that
         // updated icons are re-fetched rather than reusing stale files.
-        String appIconId = btn.applicationIconKey.length() > 0
-            ? btn.applicationIconKey
-            : String("app_") + String(btn.applicationId);
+        String appIconId = contentBtn.applicationIconKey.length() > 0
+            ? contentBtn.applicationIconKey
+            : String("app_") + String(contentBtn.applicationId);
 
         Serial.print("[ButtonRenderer] drawButton page=");
-        Serial.print(btn.page);
+        Serial.print(contentBtn.page);
         Serial.print(" slot=");
-        Serial.print(btn.slot);
+        Serial.print(contentBtn.slot);
         Serial.print(" appId=");
-        Serial.print(btn.applicationId);
+        Serial.print(contentBtn.applicationId);
         Serial.print(" hasAppIcon=");
-        Serial.print(btn.hasApplicationIcon ? "true" : "false");
+        Serial.print(contentBtn.hasApplicationIcon ? "true" : "false");
         Serial.print(" appIconId='");
         Serial.print(appIconId);
         Serial.println("'");
@@ -828,10 +1201,10 @@ void ButtonRenderer::drawButton(const Button& btn, bool highlight) {
 
             // Compute icon placement within the inner face, similar to
             // drawEsp32Icon but using the PNG's native dimensions.
-            int16_t innerX = btn.x + 2;
-            int16_t innerY = btn.y + 1;
-            int16_t innerW = btn.w - 4;
-            int16_t innerH = btn.h - 4;
+            int16_t innerX = contentBtn.x + 2;
+            int16_t innerY = contentBtn.y + 1;
+            int16_t innerW = contentBtn.w - 4;
+            int16_t innerH = contentBtn.h - 4;
             if (innerW > 0 && innerH > 0) {
                 // Decode twice: first pass to detect icon type, second to render.
                 iconBgColor = faceColor;
@@ -962,7 +1335,7 @@ void ButtonRenderer::drawButton(const Button& btn, bool highlight) {
         if (iconId.length() > 0) {
             uint16_t iconColor = btn.iconColor;
             iconFgColor = iconColor;
-            iconDrawn = drawEsp32Icon(btn, faceColor);
+            iconDrawn = drawEsp32Icon(contentBtn, faceColor);
         }
     }
 
@@ -995,15 +1368,13 @@ void ButtonRenderer::drawButton(const Button& btn, bool highlight) {
                 label = label.substring(0, limitChars);
             }
 
-            int maxWidth = btn.w - 10;
+            int maxWidth = contentBtn.w - 10;
             while (display.textWidth(label) > maxWidth && label.length() > 0) {
                 label = label.substring(0, label.length() - 1);
             }
 
-            // Place text slightly higher so it sits fully inside the button,
-            // visually aligned with the bottom edge of the rounded rect
-            int16_t labelY = btn.y + btn.h - 10;
-            display.drawCentreString(label, btn.x + btn.w / 2, labelY);
+            int16_t labelY = contentBtn.y + contentBtn.h - 10;
+            display.drawCentreString(label, contentBtn.x + contentBtn.w / 2, labelY);
         }
     }
 }
@@ -1179,20 +1550,44 @@ void ButtonRenderer::pressButton(int index) {
     pressStartTime = millis();
 
     // Visual feedback: in macro keypad mode we can redraw just this button.
-    // In Task Keypad mode, buttons are packed into different visual slots, so
-    // we ask the main loop to perform a full packed re-render instead of
-    // drawing at the original macro layout coordinates.
-    if (isTaskKeypadMode) {
-        extern bool buttonsDirty;
-        buttonsDirty = true;
-    } else {
+    // In Task Keypad mode, avoid forcing a full-screen refresh on press;
+    // Taskpad visuals are driven by task_app_state updates from the host.
+    if (!isTaskKeypadMode) {
         showPressFeedback(index);
     }
 
-    // Send to server
+    // Send to server or host bridge. In Bluetooth mode (or AUTO with an
+    // active BLE connection), we send a JSON message over BLE so the
+    // ble_bluetooth_bridge can forward the press to the HTTP API. In pure
+    // WiFi mode we keep using the existing HTTP endpoint.
     const Button& btn = buttons[index];
     if (btn.actionId.length() > 0) {
-        apiClient.sendButtonPress(btn.slot, "tap");
+        ConnectionMode mode = getConnectionMode();
+        bool useBle = false;
+
+        if (mode == ConnectionMode::BLUETOOTH) {
+            useBle = true;
+        } else if (mode == ConnectionMode::AUTO && btManager.isConnected()) {
+            useBle = true;
+        }
+
+        if (useBle) {
+            extern SecureStorage storage;
+            String padUUID = storage.getPadUUID();
+
+            // Minimal JSON payload; the BLE bridge will translate this into
+            // an HTTP POST /press call on the API server.
+            String line = "{";
+            line += "\"type\":\"button_press\",";
+            line += "\"pad_uuid\":\"" + padUUID + "\",";
+            line += "\"slot\":" + String(btn.slot) + ",";
+            line += "\"press_type\":\"tap\"";
+            line += "}";
+
+            btManager.sendJsonLine(line);
+        } else {
+            apiClient.sendButtonPress(btn.slot, "tap");
+        }
     }
 }
 
@@ -1200,10 +1595,7 @@ void ButtonRenderer::releaseButton(int index) {
     if (index < 0 || index >= (int)buttons.size()) return;
 
     buttons[index].pressed = false;
-    if (isTaskKeypadMode) {
-        extern bool buttonsDirty;
-        buttonsDirty = true;
-    } else {
+    if (!isTaskKeypadMode) {
         renderButton(index);
     }
 
@@ -1221,6 +1613,7 @@ void ButtonRenderer::showPressFeedback(int index) {
     if (index < 0 || index >= (int)buttons.size()) return;
 
     // Redraw with highlight
+    clearButtonRegion(buttons[index]);
     drawButton(buttons[index], true);
 }
 
@@ -1265,10 +1658,9 @@ int ButtonRenderer::checkPageIndicatorTouch(int x, int y) {
         return 0;
     }
 
-    const int taskbarHeight = 16;
-    const int indicatorSize = 18;
-    const int radius = indicatorSize / 2;
-    const int centerY = taskbarHeight + radius + 1;
+    const int indicatorSize = PAGE_INDICATOR_SIZE;
+    const int radius = PAGE_INDICATOR_RADIUS;
+    const int centerY = PAGE_INDICATOR_CENTER_Y;
 
     int pagesToShow = totalPages;
     if (pagesToShow > 4) {

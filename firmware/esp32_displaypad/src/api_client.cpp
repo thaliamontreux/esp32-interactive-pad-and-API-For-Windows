@@ -2,8 +2,10 @@
 #include "storage.h"
 #include <mbedtls/md.h>
 #include <time.h>
+#include <sys/time.h>
 
 #include "button_renderer.h"
+#include "display.h"
 
 APIClient apiClient;
 
@@ -192,6 +194,34 @@ APIStatus APIClient::confirmConfigApplied(uint32_t version) {
     return (httpCode == HTTP_CODE_OK) ? APIStatus::OK : APIStatus::HTTP_ERROR;
 }
 
+APIStatus APIClient::getHostSessionState(bool& locked) {
+    String url = "http://" + serverHost + ":" + serverPort + "/api/v1/system/host_session_state";
+
+    HTTPClient http;
+    http.begin(url);
+    addAuthHeaders(http);
+
+    int httpCode = http.GET();
+    if (httpCode == HTTP_CODE_OK) {
+        String responseBody = http.getString();
+        JsonDocument response;
+        DeserializationError error = deserializeJson(response, responseBody);
+        http.end();
+        if (error) {
+            return APIStatus::HTTP_ERROR;
+        }
+        locked = response["locked"] | false;
+        return APIStatus::OK;
+    }
+
+    http.end();
+    if (httpCode == 401) {
+        Serial.println("[API] 401 Unauthorized - authentication failed");
+        return APIStatus::AUTH_ERROR;
+    }
+    return APIStatus::HTTP_ERROR;
+}
+
 APIStatus APIClient::sendButtonPress(int slot, const String& pressType) {
     String url = "http://" + serverHost + ":" + serverPort + "/api/v1/pads/" +
                  storage.getPadUUID() + "/press";
@@ -257,6 +287,13 @@ void APIClient::onWSMessage(WebsocketsMessage message) {
         String msgType = doc["type"].as<String>();
 
         if (msgType == "task_app_state") {
+            extern bool g_hostDisplayLocked;
+            // While the host display is locked we keep showing the lock
+            // screen image and ignore task_app_state updates so the keypad
+            // UI does not change underneath the lock screen.
+            if (g_hostDisplayLocked) {
+                return;
+            }
             // Real-time Task Keypad update: server is telling us which
             // application-launch buttons are currently backed by running
             // processes on the host. We update the ButtonRenderer's
@@ -278,6 +315,45 @@ void APIClient::onWSMessage(WebsocketsMessage message) {
             // Mark buttons dirty so the main loop knows to re-render.
             extern bool buttonsDirty;
             buttonsDirty = true;
+            return;
+        }
+
+        if (msgType == "time") {
+            long epoch = doc["epoch"] | 0;
+            if (epoch > 0) {
+                struct timeval tv;
+                tv.tv_sec = epoch;
+                tv.tv_usec = 0;
+                settimeofday(&tv, nullptr);
+            }
+            return;
+        }
+
+        if (msgType == "host_display_state") {
+            String state = doc["state"].as<String>();
+            bool locked = (state == "locked");
+
+            extern DisplayManager display;
+            extern ButtonRenderer buttonRenderer;
+            extern bool g_hostDisplayLocked;
+
+            // Ensure backlight is on so the lock screen image is visible.
+            display.setBacklight(true);
+
+            // Remember the host lock state so that the main render loop can
+            // suppress normal button drawing while locked.
+            g_hostDisplayLocked = locked;
+
+            if (locked) {
+                Serial.println("[POWER] WiFi: host_display_state=locked; showing lock screen");
+                buttonRenderer.showHostLockScreen();
+            } else {
+                // On unlock, mark buttons dirty so the normal keypad UI is
+                // fully re-rendered.
+                Serial.println("[POWER] WiFi: host_display_state=unlocked; refreshing buttons");
+                extern bool buttonsDirty;
+                buttonsDirty = true;
+            }
             return;
         }
 
@@ -330,6 +406,13 @@ void APIClient::startLogSession(const String& sessionUUID, const String& bootRea
     String body;
     serializeJson(doc, body);
     wsClient.send(body);
+}
+
+void APIClient::sendPadStatus(const String& payload) {
+    if (!isWebSocketConnected()) {
+        return;
+    }
+    wsClient.send(payload);
 }
 
 void APIClient::sendLogLine(const String& sessionUUID, uint32_t seq, const String& message, const String& level) {
